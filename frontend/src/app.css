@@ -1,0 +1,178 @@
+/* ───────────────────────────────────────────────────────────────────────
+   設計 token — 單一來源。各元件一律用 var(--c-*)，不再硬寫 hex。
+   色值是既有面板色票的「忠實改名」（值不變），改顏色只改這裡一處。
+   ─────────────────────────────────────────────────────────────────────── */
+:root {
+  /* 表面 / 線條 */
+  --c-bg:          #0f172a;  /* 頁底、輸入井 */
+  --c-bg-deep:     #0b1220;  /* 頂部導覽 */
+  --c-panel:       #1e293b;  /* 卡片 / 工具列 */
+  --c-panel-hover: #243044;  /* 列 hover */
+  --c-row-edit:    #1e2a3a;  /* 編輯中列 */
+  --c-line:        #334155;  /* 邊框 / 中性鍵底 */
+  --c-line-2:      #475569;  /* 較亮邊框 / hover 鍵底 */
+  --c-line-faint:  #172033;  /* 表格細線 */
+  --c-dash:        #283548;  /* 虛線分隔 */
+  --c-errbox-bg:   #1c1017;  /* 錯誤框底 */
+
+  /* 文字 */
+  --c-text:   #e2e8f0;  /* 主文字 */
+  --c-text-2: #cbd5e1;
+  --c-text-3: #94a3b8;
+  --c-muted:  #64748b;  /* 次要 / 標籤 */
+
+  /* 藍（強調 / 作用中） */
+  --c-accent:        #3b82f6;
+  --c-accent-2:      #2563eb;
+  --c-accent-strong: #1d4ed8;
+  --c-accent-text:   #60a5fa;
+  --c-accent-pale:   #e0f2fe;
+
+  /* 青（保持 / held） */
+  --c-hold:        #0e7490;
+  --c-hold-bright: #06b6d4;
+  --c-hold-dot:    #22d3ee;
+  --c-hold-line:   #0891b2;
+
+  /* 綠（正常 / 生產） */
+  --c-ok-bg:   #14532d;
+  --c-ok:      #4ade80;
+  --c-ok-pale: #bbf7d0;
+  --c-go:      #15803d;
+  --c-go-hover:#16a34a;
+  --c-go-dot:  #22c55e;
+
+  /* 琥珀（警告） */
+  --c-warn-bg:   #78350f;
+  --c-warn-bg-2: #422006;
+  --c-warn:      #fbbf24;
+
+  /* 紅（停止 / 故障） */
+  --c-stop-bg:    #7f1d1d;
+  --c-stop:       #b91c1c;
+  --c-stop-hover: #dc2626;
+  --c-stop-text:  #fca5a5;
+  --c-danger:     #f87171;
+
+  /* 尺寸 */
+  --tap: 44px;          /* 觸控最小目標（面板 PC / 手套手指） */
+  --radius: 8px;
+  --radius-sm: 4px;
+  --radius-pill: 999px;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* 全域 reset（原本散在 App.svelte，集中至此） */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body { background: var(--c-bg); font-family: system-ui, sans-serif; color: var(--c-text); }
+/* App shell：整頁撐滿視窗高，分頁內容當 flex 子項。主控頁靠此讓 .mc(flex:1) 撐滿視窗，
+   控制列才能當最後一個 flex 子項自然釘底（不用 position:fixed）。
+   其他分頁維持自然高度、頂端對齊（無回歸）。 */
+#app { min-height: 100vh; display: flex; flex-direction: column; }
+
+/* 全域鍵盤焦點環 — 原本全站都沒有，PC/鍵盤操作看不出焦點在哪。
+   只在鍵盤聚焦時顯示（:focus-visible，滑鼠點按不出環）。
+   用 :where() 保持 specificity 為 0，元件仍可自訂覆寫。 */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+   緊急停止 — 全域共用元件。大、紅、不會認錯。
+   latching：按一下觸發並閂住，再按一下解除（對應 xEMS 意圖位元）。
+   觸發時脈動，跨房間也看得到。撥桿(toggle)語意不對，E-Stop 必須是按鈕。
+   ─────────────────────────────────────────────────────────────────────── */
+.estop {
+  display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+  width: 100%; min-height: 56px; padding: 0.8rem 1rem;
+  border: 2px solid var(--c-stop); border-radius: var(--radius);
+  background: var(--c-stop-bg); color: var(--c-stop-text);
+  font-size: 1.05rem; font-weight: 800; letter-spacing: 0.04em;
+  cursor: pointer; user-select: none; touch-action: manipulation;
+}
+.estop:hover:not(:disabled) { background: var(--c-stop); color: #fff; }
+.estop:disabled { opacity: 0.45; cursor: not-allowed; }
+.estop .ico { font-size: 1.35rem; line-height: 1; }
+.estop.engaged {
+  background: var(--c-stop); color: #fff; border-color: #fff;
+  animation: estop-pulse 1s ease-in-out infinite;
+}
+@keyframes estop-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.75); }
+  50%      { box-shadow: 0 0 0 7px rgba(220, 38, 38, 0); }
+}
+@media (prefers-reduced-motion: reduce) { .estop.engaged { animation: none; box-shadow: 0 0 12px var(--c-stop-hover); } }
+
+/* ───────────────────────────────────────────────────────────────────────
+   共用元件樣式 — 單一來源。原本逐字複製在 MachineControl / OrderQueue /
+   OrderEditor / DriveShear / CTDrive 的 <style> 內的
+   工具列、卡片、藥丸、按鈕、提示框，集中於此。改一處，全站一致。
+   （燈號 .lamp / 開關 .switch 因 MachineControl 的 .lamp 是「可按的按鈕」、
+     與驅動頁的唯讀燈語意不同，刻意留在各元件內，避免類名衝突。
+     .badge 在各處形狀不同（藥丸 vs 方標）亦留在元件內。）
+   元件 <style> 內的 scoped 規則優先序較高，需要時仍可局部覆寫。
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* 工具列 */
+.bar  { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; background: var(--c-panel); padding: 0.5rem 0.75rem; border-radius: var(--radius); font-size: 0.85rem; }
+.lbl  { color: var(--c-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.sep  { display: inline-block; width: 1px; height: 1.2rem; background: var(--c-line); margin: 0 0.25rem; }
+.auto { display: inline-flex; gap: 0.3rem; align-items: center; color: var(--c-text-3); font-size: 0.78rem; }
+.auto input { accent-color: var(--c-accent); }
+.ival { background: var(--c-bg); border: 1px solid var(--c-line); color: var(--c-text); border-radius: var(--radius-sm); padding: 0.15rem 0.35rem; font-size: 0.78rem; }
+.ival:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 文字工具 */
+.mono { font-family: var(--font-mono); color: var(--c-text); }
+.dim  { color: var(--c-muted); }
+
+/* 狀態藥丸 */
+.pill { font-size: 0.65rem; padding: 0.1rem 0.5rem; border-radius: var(--radius-pill); background: var(--c-line); color: var(--c-text-3); }
+.pill.ok   { background: var(--c-ok-bg);   color: var(--c-ok); }
+.pill.warn { background: var(--c-warn-bg); color: var(--c-warn); }
+.pill.err  { background: var(--c-stop-bg); color: var(--c-stop-text); }
+
+/* 狀態徽章（藥丸形）— 訂單狀態 / 量測來源 / 開關旗標，全站單一來源。
+   原本逐字複製在 MachineControl / OrderQueue / OrderEditor，集中於此。
+   （CTDrive 的 eff-* 是方標、形狀不同，刻意留在元件內。） */
+.badge          { font-size: 0.72rem; padding: 0.1rem 0.55rem; border-radius: var(--radius-pill); background: var(--c-line); color: var(--c-text-3); }
+.badge.on       { background: var(--c-accent-strong); color: #fff; }
+.badge.src      { background: var(--c-hold);          color: var(--c-accent-pale); }
+.badge.active   { background: var(--c-accent-strong); color: #fff; }
+.badge.queued   { background: var(--c-line);          color: var(--c-text-2); }
+.badge.done     { background: var(--c-ok-bg);         color: var(--c-ok); }
+.badge.canceled { background: var(--c-stop-bg);       color: var(--c-stop-text); }
+
+/* 一般工具按鈕 */
+.btn { background: var(--c-line); color: var(--c-text); border: none; border-radius: var(--radius-sm); padding: 0.3rem 0.7rem; cursor: pointer; font-size: 0.82rem; }
+.btn:hover:not(:disabled) { background: var(--c-line-2); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.primary { background: var(--c-accent-strong); }
+.btn.primary:hover:not(:disabled) { background: var(--c-accent-2); }
+.btn.danger  { background: var(--c-stop-bg); }
+.btn.danger:hover:not(:disabled) { background: var(--c-stop-hover); }
+.kbd { font-size: 0.68rem; opacity: 0.75; margin-left: 0.3rem; padding: 0 0.25rem; border: 1px solid currentColor; border-radius: 3px; }
+
+/* 卡片 */
+.card    { background: var(--c-panel); border-radius: var(--radius); padding: 0.6rem 0.8rem; display: flex; flex-direction: column; gap: 0.55rem; border: 1px solid transparent; }
+.cardhdr { display: flex; justify-content: space-between; align-items: baseline; color: var(--c-text); font-weight: 600; font-size: 0.9rem; border-bottom: 1px solid var(--c-line); padding-bottom: 0.35rem; }
+.note    { color: var(--c-muted); font-size: 0.75rem; margin: 0; line-height: 1.45; }
+
+/* 命令按鈕（含按住式 jog / 脈衝）。jog 用 touch-action:none：按住期間不可滾動。 */
+.cmdbtn { border: none; border-radius: 6px; padding: 0.45rem 0.85rem; min-height: var(--tap); font-size: 0.85rem; cursor: pointer; color: var(--c-text); background: var(--c-line); user-select: none; touch-action: manipulation; }
+.cmdbtn:disabled { opacity: 0.45; cursor: not-allowed; }
+.cmdbtn.held { background: var(--c-hold); box-shadow: 0 0 8px var(--c-hold-bright); }
+.cmdbtn.jog  { background: var(--c-hold); touch-action: none; }
+.cmdbtn.jog.held { background: var(--c-hold-bright); box-shadow: 0 0 8px var(--c-hold-bright); }
+.cmdbtn.pulse { background: var(--c-line-2); }
+.cmdbtn.pulse:hover:not(:disabled) { background: var(--c-muted); }
+
+/* 提示 / 錯誤框 */
+.errbox { background: var(--c-errbox-bg); color: var(--c-stop-text); padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.82rem; white-space: pre-wrap; margin: 0; }
+.rtwarn { background: var(--c-panel); border-left: 3px solid var(--c-warn); color: var(--c-text-2); padding: 0.6rem 0.8rem; border-radius: 6px; font-size: 0.82rem; line-height: 1.5; }
+.rtwarn strong { color: var(--c-warn); }
+.rtwarn code   { background: var(--c-bg); padding: 0.1rem 0.4rem; border-radius: 3px; color: var(--c-warn); }
+.waiting { color: var(--c-muted); padding: 2rem; text-align: center; background: var(--c-panel); border-radius: var(--radius); }
+.waiting code { background: var(--c-bg); padding: 0.1rem 0.4rem; border-radius: 3px; color: var(--c-warn); }

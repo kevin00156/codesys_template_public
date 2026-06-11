@@ -1,0 +1,60 @@
+backend/dist/
+backend/certs/
+# TLS certs staged by `make cert` — self-signed, machine-local; the private key
+# must never be committed. Regenerate with `make cert`.
+/certs/
+# Stray cross-compiled binary (build output belongs in backend/dist/)
+backend/plc_bridge
+/plc_bridge.exe
+frontend/dist/
+frontend/node_modules/
+*.new
+.claude/settings.local.json
+.claude/worktrees/
+# Per-session runtime lock; mutates every session, never portable
+.claude/scheduled_tasks.lock
+
+# Local deployment config (PLC_HOST / PLC_USER); copy .env.example to .env
+.env
+
+# Office temp lock files (created while a doc is open)
+~$*
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# CODESYS trace dumps (huge binaries; capture-only artifacts, never commit)
+*.trace
+reference/trace*.xml
+
+# Local scratch reference material (vendor xlsx / specs / demos) — not portable.
+# Machine-specific reference material belongs on that machine's branch, not the
+# template. (`refernce/` is the historical typo; keep both ignored.)
+refernce/
+references/
+
+# Local runtime scratch dir (bridge.log, local db, screenshots, built exes,
+# cookies) — created while running the bridge locally; never portable
+.run-tmp/
+
+# CODESYS export sync metadata — local sync timestamps / hashes, not portable
+codesys_export/sync_metadata.json
+
+*.log
+
+# Vite TypeScript config compile cache (transient, never commit)
+*.timestamp-*.mjs
+
+.playwright-mcp/
+
+# Playwright run artifacts (traces, reports) — regenerated every run
+frontend/test-results/
+frontend/playwright-report/
+
+# plc_bridge runtime state — a machine build creates local stores (e.g. *.db,
+# config json, recipes) in CWD when run locally for offline testing; these
+# normally live on the deploy target, not in the repo. Machine branches extend
+# this list with their own state files.
+/*.db
+/recipes/

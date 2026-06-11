@@ -1,0 +1,41 @@
+name: CI
+
+# Every push, every branch. ubuntu-latest is closer to the deploy target than
+# the Windows dev host: the linux-only shm mapping code compiles here too.
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Frontend first: the Go binary embeds frontend/dist (see frontend/embed.go),
+      # so the bundle must exist before `go vet`/`go build` reach
+      # ./backend/cmd/plc_bridge, which imports it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend install
+        working-directory: frontend
+        run: npm ci
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./backend/...
+      - name: Test
+        run: go test ./backend/...
+      - name: Cross-compile (linux/amd64 — the deploy target)
+        run: GOOS=linux GOARCH=amd64 go build -o /dev/null ./backend/cmd/plc_bridge
+
+      # Playwright e2e scaffold lives in frontend/ (playwright.config.ts + tests/)
+      # and runs locally via `npm run test:e2e`. It is intentionally NOT wired
+      # into CI on the clean template — add install/run/upload steps here once
+      # this base grows real screens worth gating on.

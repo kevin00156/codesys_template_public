@@ -1,0 +1,53 @@
+[Unit]
+Description=plc_bridge — PLC shm reader + Modbus TCP slave + HTTP API
+After=network-online.target codesyscontrol.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/plc_bridge
+# CODESYS runs as root in WSL, so it Creates /dev/shm/plc_{data,cmd} as
+# root:root 0750 — unreadable to this service user, which is why the master
+# control reports "PLC 未連線". Widen the segments before the bridge opens them.
+# '+' runs this one step with full privileges (User=/NoNewPrivileges/sandbox
+# ignored); it re-applies on every start because CODESYS re-Creates the
+# segments root:root on each runtime restart. Wait up to 15s for the IEC boot
+# app to publish them, then widen (plc_data read-only, plc_cmd read-write).
+# Never fails the unit: if CODESYS is down the bridge still serves the frontend +
+# HTTP API, exactly as the available:false degradation intends.
+ExecStartPre=+/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/plc_data ] && [ -e /dev/shm/plc_cmd ] && break; sleep 0.5; done; chmod o+r /dev/shm/plc_data 2>/dev/null || true; chmod o+rw /dev/shm/plc_cmd 2>/dev/null || true'
+# Role-password auth: the PLC_BRIDGE_*_HASH vars live in this optional env file
+# (root:plc_bridge 0640), kept out of git and off the command line. Mint each with
+#   /opt/plc_bridge/plc_bridge -gen-hash      (reads the password from stdin)
+# and write into the file below (each tier optional):
+#   PLC_BRIDGE_PASSWORD_HASH=<hash>   vendor 廠商  — highest tier, every write
+#   PLC_BRIDGE_TUNER_HASH=<hash>      tuner  調機  — tuning / debug-screen writes
+#   PLC_BRIDGE_OPERATOR_HASH=<hash>   operator 操作員 — routine machine writes
+#                                     (unset => those writes stay open, old behavior)
+# Leave the file absent to run with auth disabled (dev posture). The leading '-'
+# means a missing file is not an error.
+EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
+# TLS auto-enables when cert.pem/key.pem exist in WorkingDirectory
+# (/opt/plc_bridge) — installed by `make deploy-certs`. No certs => plain HTTP,
+# over which the password and session cookie travel in clear; install certs for
+# production. Dropping them in and restarting is enough; no flag change needed.
+ExecStart=/opt/plc_bridge/plc_bridge --modbus=:5020
+Restart=on-failure
+RestartSec=2
+
+# Security hardening (mirrors production; CPUAffinity dropped — no isolcpus in WSL)
+User=plc_bridge
+Group=plc_bridge
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# /dev/shm for PLC IPC; /opt/plc_bridge for the bridge's working-dir state (any
+# local SQLite stores / runtime files, resolved against WorkingDirectory) —
+# without it a machine build crash-loops on a read-only state dir under ProtectSystem=strict.
+ReadWritePaths=/dev/shm /opt/plc_bridge
+PrivateTmp=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

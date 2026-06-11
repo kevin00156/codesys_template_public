@@ -1,0 +1,7 @@
+{
+  "go.toolsEnvVars": {
+    "GOOS": "linux"
+  },
+  "gitlens.plusFeatures.enabled": false,
+  "gitlens.showWhatsNewAfterUpgrades": false
+}

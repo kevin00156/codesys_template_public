@@ -1,0 +1,4 @@
+METHOD PROTECTED Init : BOOL
+
+// === IMPLEMENTATION ===
+Init:=TRUE;

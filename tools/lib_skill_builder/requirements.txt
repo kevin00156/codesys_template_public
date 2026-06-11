@@ -1,0 +1,4 @@
+requests>=2.28.0
+html2text>=2020.1.16
+# 備援 HTML parser（html2text 較快但若安裝失敗可用 BS4）
+beautifulsoup4>=4.10.0

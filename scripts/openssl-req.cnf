@@ -1,0 +1,8 @@
+# Minimal openssl req config so cert generation does not depend on a system
+# openssl.cnf being present (it often isn't on Windows / conda openssl). Used
+# by the Makefile `cert` target with -config; the SAN is supplied via -addext.
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = plc_bridge
