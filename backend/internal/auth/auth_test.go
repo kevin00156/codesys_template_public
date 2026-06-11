@@ -254,6 +254,78 @@ func TestTunerRoleMatrix(t *testing.T) {
 	}
 }
 
+// TestAllows mirrors Wrap's policy on the path the WebSocket command plane uses.
+func TestAllows(t *testing.T) {
+	// Auth disabled: everything allowed.
+	open := New("", "", "", false)
+	if !open.Allows(httptest.NewRequest("GET", "/ws", nil), RoleVendor) {
+		t.Fatal("disabled auth must allow any required role")
+	}
+
+	vh, _ := HashPassword("vendorpw")
+	a := New(vh, "", "", false) // vendor only; operator tier not gated
+
+	anon := httptest.NewRequest("GET", "/ws", nil)
+	if !a.Allows(anon, RoleOperator) {
+		t.Error("operator tier must stay open with no operator hash")
+	}
+	if a.Allows(anon, RoleTuner) {
+		t.Error("anon must not satisfy tuner")
+	}
+	if a.Allows(anon, RoleVendor) {
+		t.Error("anon must not satisfy vendor")
+	}
+
+	cookie := login(t, a, "vendorpw")
+	if cookie == nil {
+		t.Fatal("vendor login failed")
+	}
+	authed := httptest.NewRequest("GET", "/ws", nil)
+	authed.AddCookie(cookie)
+	for _, role := range []Role{RoleOperator, RoleTuner, RoleVendor} {
+		if !a.Allows(authed, role) {
+			t.Errorf("vendor session must satisfy %s", role)
+		}
+	}
+}
+
+// TestLoginThrottle: after maxLoginFails wrong passwords from one IP the next
+// attempt is locked out with 429 — even a correct password — until the window
+// passes.
+func TestLoginThrottle(t *testing.T) {
+	vh, _ := HashPassword("vendorpw")
+	a := New(vh, "", "", false)
+
+	post := func(pw string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"password":"`+pw+`"}`))
+		req.RemoteAddr = "192.0.2.7:5555"
+		a.handleLogin(rec, req)
+		return rec.Code
+	}
+
+	for i := 0; i < maxLoginFails; i++ {
+		if c := post("wrong"); c != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: want 401, got %d", i, c)
+		}
+	}
+	if c := post("wrong"); c != http.StatusTooManyRequests {
+		t.Fatalf("after lockout: want 429, got %d", c)
+	}
+	if c := post("vendorpw"); c != http.StatusTooManyRequests {
+		t.Fatalf("correct password during lockout must still be 429, got %d", c)
+	}
+
+	// A different IP is unaffected.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/login", strings.NewReader(`{"password":"vendorpw"}`))
+	req.RemoteAddr = "192.0.2.99:5555"
+	a.handleLogin(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("untainted IP: want 200, got %d", rec.Code)
+	}
+}
+
 func TestSecureFlagFollowsTLS(t *testing.T) {
 	hash, _ := HashPassword("x")
 	a := New(hash, "", "", true) // serving TLS

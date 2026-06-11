@@ -33,7 +33,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -43,6 +45,16 @@ import (
 const (
 	cookieName = "plc_session"
 	sessionTTL = 12 * time.Hour
+
+	// Login throttle. bcrypt is deliberately slow, so an unauthenticated caller
+	// can both brute-force passwords and amplify a few requests into CPU
+	// exhaustion (one bcrypt per attempt). After maxLoginFails wrong passwords
+	// from one client IP we lock that IP out for loginLockout before trying
+	// another hash. maxLoginBytes caps the request body so a giant payload can't
+	// balloon memory before we even look at it.
+	maxLoginFails = 5
+	loginLockout  = 1 * time.Minute
+	maxLoginBytes = 4 << 10 // 4 KiB
 )
 
 // Role is a session privilege level, strictly ordered:
@@ -56,8 +68,8 @@ const (
 	RoleVendor   Role = "vendor"   // 廠商 (full access)
 )
 
-// satisfies reports whether a session role meets a route requirement.
-func (r Role) satisfies(required Role) bool {
+// Satisfies reports whether a session role meets a route requirement.
+func (r Role) Satisfies(required Role) bool {
 	switch required {
 	case RoleNone:
 		return true
@@ -85,6 +97,16 @@ type Authenticator struct {
 
 	mu     sync.Mutex
 	tokens map[string]session
+
+	loginMu   sync.Mutex
+	loginFail map[string]loginAttempt // client IP -> recent failure state
+}
+
+// loginAttempt tracks one client IP's recent failed logins. While now < until
+// the IP is locked out and no bcrypt comparison runs for it.
+type loginAttempt struct {
+	fails int
+	until time.Time
 }
 
 // New builds an Authenticator. Empty hashes disable auth entirely: every
@@ -92,7 +114,7 @@ type Authenticator struct {
 // posture on a dev box. secure should be true when serving TLS so the cookie
 // is never sent in clear.
 func New(vendorHash, tunerHash, operatorHash string, secure bool) *Authenticator {
-	a := &Authenticator{secure: secure, tokens: map[string]session{}}
+	a := &Authenticator{secure: secure, tokens: map[string]session{}, loginFail: map[string]loginAttempt{}}
 	if vendorHash != "" {
 		a.vendorHash = []byte(vendorHash)
 	}
@@ -143,7 +165,7 @@ func (a *Authenticator) Wrap(next http.Handler, requiredRole func(r *http.Reques
 			if req == RoleOperator && !a.OperatorGated() {
 				req = RoleNone // operator tier not configured — stays open
 			}
-			if req != RoleNone && !a.sessionRole(r).satisfies(req) {
+			if req != RoleNone && !a.sessionRole(r).Satisfies(req) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "需要登入"})
 				return
 			}
@@ -151,6 +173,27 @@ func (a *Authenticator) Wrap(next http.Handler, requiredRole func(r *http.Reques
 		next.ServeHTTP(w, r)
 	})
 }
+
+// Allows reports whether the request's session may perform an action that
+// requires `required`. It applies the same policy as Wrap — auth disabled lets
+// everything through, and the operator tier downgrades to open when no operator
+// hash is configured — so non-HTTP surfaces (the WebSocket command plane) gate
+// on identical rules. The whole point: the login wall must protect the control
+// path, not just HTTP routes.
+func (a *Authenticator) Allows(r *http.Request, required Role) bool {
+	if !a.Enabled() || required == RoleNone {
+		return true
+	}
+	if required == RoleOperator && !a.OperatorGated() {
+		return true // operator tier not configured — stays open (back-compat)
+	}
+	return a.sessionRole(r).Satisfies(required)
+}
+
+// SessionRole exposes the live session role for a request (RoleNone when not
+// logged in; RoleVendor when auth is disabled). Used for audit logging on the
+// command plane.
+func (a *Authenticator) SessionRole(r *http.Request) Role { return a.sessionRole(r) }
 
 func (a *Authenticator) handleStatus(w http.ResponseWriter, r *http.Request) {
 	role := a.sessionRole(r)
@@ -168,6 +211,15 @@ func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "role": string(RoleVendor)})
 		return
 	}
+	now := time.Now()
+	ip := clientIP(r)
+	if locked, retry := a.loginThrottled(ip, now); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "嘗試次數過多，請稍後再試"})
+		return
+	}
+	// Cap the body before decoding so an oversized payload can't balloon memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBytes)
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -185,6 +237,7 @@ func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
 	} else if a.operatorHash != nil && bcrypt.CompareHashAndPassword(a.operatorHash, []byte(body.Password)) == nil {
 		role = RoleOperator
 	}
+	a.recordLogin(ip, role != RoleNone, now)
 	if role == RoleNone {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "密碼錯誤"})
 		return
@@ -217,6 +270,49 @@ func (a *Authenticator) handleLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// loginThrottled reports whether ip is currently locked out, and for how long.
+func (a *Authenticator) loginThrottled(ip string, now time.Time) (bool, time.Duration) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	at, ok := a.loginFail[ip]
+	if ok && now.Before(at.until) {
+		return true, at.until.Sub(now)
+	}
+	return false, 0
+}
+
+// recordLogin updates the failure counter for ip. A success clears it; the
+// maxLoginFails-th failure arms a loginLockout window. It also opportunistically
+// drops stale entries so the map can't grow without bound.
+func (a *Authenticator) recordLogin(ip string, ok bool, now time.Time) {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	if ok {
+		delete(a.loginFail, ip)
+		return
+	}
+	at := a.loginFail[ip]
+	at.fails++
+	if at.fails >= maxLoginFails {
+		at.until = now.Add(loginLockout)
+		at.fails = 0 // counter resets; the lock window now does the gating
+	}
+	a.loginFail[ip] = at
+	for k, v := range a.loginFail {
+		if v.fails == 0 && now.After(v.until) {
+			delete(a.loginFail, k)
+		}
+	}
+}
+
+// clientIP extracts the host portion of r.RemoteAddr for throttle keying.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // newToken mints a 256-bit random session token, records it with its role, and

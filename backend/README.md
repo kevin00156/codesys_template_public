@@ -104,7 +104,31 @@ Version mismatch → plc_bridge logs error and exits (Restart=on-failure retries
 taskset -c 0 go run ./backend/cmd/plc_bridge
 ```
 
-Flags: `--modbus :5020` `--http :8080` `--poll 10ms` `--push 100ms`
+Flags: `--modbus :5020` `--modbus-allow ""` `--http :8080` `--poll 10ms` `--push 100ms`
+
+## Security posture
+
+This bridge sits between an industrial machine and the network, so the
+write paths are gated:
+
+- **HTTP + WebSocket auth.** Role passwords (vendor ⊇ tuner ⊇ operator) come
+  from `PLC_BRIDGE_*_HASH` env vars (bcrypt; mint with `plc_bridge -gen-hash`).
+  With none set, auth is disabled — every route and the command plane are open
+  (the dev posture). The login wall covers **both** HTTP routes *and the
+  WebSocket command plane*: an unauthenticated socket may watch telemetry but
+  cannot command the machine. Per-command minimums live in
+  `wsserver.commandRole` (machine/production → operator, axis → tuner). Failed
+  logins are throttled per-IP; every command is audit-logged (peer, role, type,
+  outcome).
+- **TLS.** Drop `cert.pem`/`key.pem` in the working dir to auto-enable HTTPS;
+  the session cookie is `Secure` only then. Over plain HTTP the bridge logs a
+  warning — the password and cookie travel in clear, so install certs for
+  production.
+- **Modbus has no authentication** (protocol limitation). The documented
+  topology is SCADA on a trusted LAN. In production restrict the surface with
+  `--modbus-allow` (comma-separated IPs/CIDRs, e.g.
+  `--modbus-allow 192.168.1.0/24,10.0.0.5`); empty means allow-all. The
+  listener also reaps idle connections and caps concurrent peers.
 
 ## What this folder is NOT
 

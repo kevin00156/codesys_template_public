@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"codesys_dev/backend/internal/auth"
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
 )
@@ -19,10 +20,38 @@ type CommandSink interface {
 	Apply(func(*shm.PlcCommand) error) error
 }
 
+// Authorizer gates the command plane. *auth.Authenticator satisfies it. When
+// nil, every command is allowed — the dev posture, and what the unit tests use.
+type Authorizer interface {
+	Allows(r *http.Request, required auth.Role) bool
+	SessionRole(r *http.Request) auth.Role
+}
+
 type Server struct {
 	Snapshot *state.Snapshot
 	Commands CommandSink
+	Auth     Authorizer    // nil => command plane is open (auth disabled / dev)
 	Interval time.Duration // push interval; defaults to 100ms
+}
+
+// commandRole is the minimum role required to issue a command of a given type.
+// This is the command-plane equivalent of main.go's requiredRole predicate and
+// the real enforcement point: telemetry pushes stay open (the dashboard is
+// always-on), but a write to the machine must clear this bar.
+//
+//   - machine / production: routine operator surfaces (start, stop, run an order)
+//   - axis:                 jog / absolute move — a tuning / debug surface
+//
+// Tighten or relax per deployment; vendor ⊇ tuner ⊇ operator.
+func commandRole(t string) auth.Role {
+	switch t {
+	case "machine", "production":
+		return auth.RoleOperator
+	case "axis":
+		return auth.RoleTuner
+	default:
+		return auth.RoleNone // unknown — applyCmd rejects it anyway
+	}
 }
 
 // No CheckOrigin override: gorilla's default rejects cross-origin upgrades
@@ -86,9 +115,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var cmd CmdMsg
 		if err := json.Unmarshal(raw, &cmd); err != nil {
 			ack.OK, ack.Error = false, "invalid json"
+		} else if s.Auth != nil && !s.Auth.Allows(r, commandRole(cmd.Type)) {
+			// The login wall, enforced on the control path: an unauthenticated
+			// (or under-privileged) socket may watch telemetry but not command.
+			ack.OK, ack.Error = false, "需要登入"
 		} else if applyErr := s.applyCmd(&cmd); applyErr != nil {
 			ack.OK, ack.Error = false, applyErr.Error()
 		}
+		s.auditCmd(r, &cmd, ack)
 		// Non-blocking: if the writer is gone (or backed up) we drop the
 		// ack rather than deadlock; the next ReadMessage will see the
 		// closed conn and break.
@@ -109,13 +143,14 @@ func (s *Server) applyCmd(cmd *CmdMsg) error {
 		case "machine":
 			c.Machine.ControlFlags = cmd.ControlFlags
 		case "axis":
-			if cmd.AxisIndex >= 0 && cmd.AxisIndex < 4 {
-				a := &c.Machine.Axes[cmd.AxisIndex]
-				a.ControlFlags = cmd.AxisFlags
-				a.JogVel       = cmd.JogVel
-				a.MoveAbsPos   = cmd.MoveAbsPos
-				a.MoveAbsVel   = cmd.MoveAbsVel
+			if cmd.AxisIndex < 0 || cmd.AxisIndex >= len(c.Machine.Axes) {
+				return fmt.Errorf("axis index %d out of range", cmd.AxisIndex)
 			}
+			a := &c.Machine.Axes[cmd.AxisIndex]
+			a.ControlFlags = cmd.AxisFlags
+			a.JogVel       = cmd.JogVel
+			a.MoveAbsPos   = cmd.MoveAbsPos
+			a.MoveAbsVel   = cmd.MoveAbsVel
 		case "production":
 			c.Production.NProductionState = cmd.NProductionState
 		default:
@@ -123,4 +158,22 @@ func (s *Server) applyCmd(cmd *CmdMsg) error {
 		}
 		return nil
 	})
+}
+
+// auditCmd logs every command-plane attempt — who (client addr + role), what
+// (type), and the outcome. An industrial control surface needs an attributable
+// trail of who moved the machine; this is that trail.
+func (s *Server) auditCmd(r *http.Request, cmd *CmdMsg, ack AckMsg) {
+	role := auth.RoleNone
+	if s.Auth != nil {
+		role = s.Auth.SessionRole(r)
+	}
+	if role == auth.RoleNone {
+		role = "-"
+	}
+	if ack.OK {
+		log.Printf("ws cmd from=%s role=%s type=%s ok", r.RemoteAddr, role, cmd.Type)
+		return
+	}
+	log.Printf("ws cmd from=%s role=%s type=%s denied=%q", r.RemoteAddr, role, cmd.Type, ack.Error)
 }

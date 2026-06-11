@@ -9,9 +9,12 @@ package modbus
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
+	"time"
 
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
@@ -26,7 +29,62 @@ const (
 	excIllegalDataAddress = 0x02
 	excIllegalDataValue   = 0x03
 	excServerFailure      = 0x04
+
+	// Modbus has no authentication of its own, so the listener self-limits:
+	// idle connections are reaped and the total is capped so a flood of
+	// half-open sockets can't exhaust the process.
+	idleTimeout = 60 * time.Second
+	maxConns    = 16
 )
+
+// Allowlist restricts which peers may speak Modbus. Empty (nil) means allow all,
+// preserving the documented SCADA-on-the-LAN topology; populate it in production
+// to pin the auth-less surface to known masters.
+type Allowlist []*net.IPNet
+
+// ParseAllowlist turns a comma-separated list of IPs and CIDRs into an
+// Allowlist. A bare IP is treated as a host route (/32 or /128). Empty input
+// yields a nil Allowlist (allow all).
+func ParseAllowlist(s string) (Allowlist, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	var out Allowlist
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if _, ipnet, err := net.ParseCIDR(tok); err == nil {
+			out = append(out, ipnet)
+			continue
+		}
+		ip := net.ParseIP(tok)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP or CIDR %q", tok)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return out, nil
+}
+
+// allows reports whether ip may connect. A nil/empty allowlist permits everyone.
+func (a Allowlist) allows(ip net.IP) bool {
+	if len(a) == 0 {
+		return true
+	}
+	for _, n := range a {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // CommandSink receives validated decoded writes. The implementation
 // must serialise concurrent calls and only publish the mutated command
@@ -39,6 +97,7 @@ type CommandSink interface {
 type Server struct {
 	Snapshot *state.Snapshot
 	Commands CommandSink
+	Allow    Allowlist // nil => allow all peers
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -46,20 +105,53 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("modbus tcp listening on %s", addr)
+	if len(s.Allow) > 0 {
+		log.Printf("modbus tcp listening on %s (allowlist: %d entries)", addr, len(s.Allow))
+	} else {
+		log.Printf("modbus tcp listening on %s (no allowlist — any host may connect)", addr)
+	}
+	sem := make(chan struct{}, maxConns)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go s.handle(conn)
+		if !s.peerAllowed(conn) {
+			log.Printf("modbus: rejected connection from %s (not in allowlist)", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				s.handle(conn)
+			}()
+		default:
+			log.Printf("modbus: refusing %s — connection cap (%d) reached", conn.RemoteAddr(), maxConns)
+			conn.Close()
+		}
 	}
+}
+
+// peerAllowed reports whether the connection's remote IP clears the allowlist.
+func (s *Server) peerAllowed(conn net.Conn) bool {
+	if len(s.Allow) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return false
+	}
+	return s.Allow.allows(net.ParseIP(host))
 }
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	var mbap [7]byte
 	for {
+		// Reap a peer that opens a connection and then stalls.
+		_ = conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		if _, err := io.ReadFull(conn, mbap[:]); err != nil {
 			return
 		}
