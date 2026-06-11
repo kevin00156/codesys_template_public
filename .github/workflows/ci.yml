@@ -1,10 +1,23 @@
 name: CI
 
-# Every push, every branch. ubuntu-latest is closer to the deploy target than
-# the Windows dev host: the linux-only shm mapping code compiles here too.
-on: push
+# Runs on every pull request (the merge gate for main) and on pushes to main
+# itself (post-merge verification). main is protected: changes land only via a
+# rebased PR whose `build` job is green — see scripts/setup-branch-protection.sh.
+# ubuntu-latest is closer to the deploy target than the Windows dev host: the
+# linux-only shm mapping code compiles here too.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same PR branch cancels the superseded run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Job id `build` is the required status check wired into branch protection.
+  # If you rename it, update the contexts list in setup-branch-protection.sh.
   build:
     runs-on: ubuntu-latest
     steps:
