@@ -58,7 +58,12 @@ class WsStore {
     }
     ws.onerror = () => ws.close()
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data)
+      let msg: any
+      try {
+        msg = JSON.parse(e.data)
+      } catch {
+        return // ignore malformed frames rather than throwing in the handler
+      }
       if (msg.type === 'data') {
         this.data = msg as PlcData
         const h = this.history

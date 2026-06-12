@@ -31,6 +31,10 @@ EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
 # (/opt/plc_bridge) — installed by `make deploy-certs`. No certs => plain HTTP,
 # over which the password and session cookie travel in clear; install certs for
 # production. Dropping them in and restarting is enough; no flag change needed.
+#
+# Modbus TCP has no authentication of its own. In production, pin the surface to
+# known SCADA/HMI hosts by adding e.g. --modbus-allow=192.168.1.0/24 below;
+# empty (the default) accepts any host that can reach the port.
 ExecStart=/opt/plc_bridge/plc_bridge --modbus=:5020
 Restart=on-failure
 RestartSec=2
