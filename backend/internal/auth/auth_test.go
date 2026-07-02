@@ -254,6 +254,35 @@ func TestTunerRoleMatrix(t *testing.T) {
 	}
 }
 
+// TestLoggedIn: the write gate used by the WebSocket command path. With auth
+// disabled every request may write; with auth enabled only a request carrying
+// a valid session of any role may.
+func TestLoggedIn(t *testing.T) {
+	// Disabled: everyone may write.
+	if !New("", "", "", false).LoggedIn(httptest.NewRequest("GET", "/ws", nil)) {
+		t.Fatal("auth disabled: LoggedIn must be true")
+	}
+
+	hash, _ := HashPassword("hunter2")
+	a := New(hash, "", "", false)
+
+	// No cookie: blocked.
+	if a.LoggedIn(httptest.NewRequest("GET", "/ws", nil)) {
+		t.Fatal("no session: LoggedIn must be false")
+	}
+
+	// Valid session: allowed.
+	cookie := login(t, a, "hunter2")
+	if cookie == nil {
+		t.Fatal("login did not set a session cookie")
+	}
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.AddCookie(cookie)
+	if !a.LoggedIn(req) {
+		t.Fatal("valid session: LoggedIn must be true")
+	}
+}
+
 func TestSecureFlagFollowsTLS(t *testing.T) {
 	hash, _ := HashPassword("x")
 	a := New(hash, "", "", true) // serving TLS

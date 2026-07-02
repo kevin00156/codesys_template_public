@@ -32,6 +32,8 @@ export interface PlcData {
   production: ProductionState
 }
 
+import { auth } from './auth.svelte.ts'
+
 const HISTORY_LEN = 300
 
 class WsStore {
@@ -66,6 +68,9 @@ class WsStore {
         if (h.length > HISTORY_LEN) h.splice(0, h.length - HISTORY_LEN)
       } else if (msg.type === 'ack') {
         this.lastAck = { ok: msg.ok, error: msg.error }
+        // Backend rejected a command because the session is gone/expired — drop
+        // back to the login screen (mirrors the HTTP-401 path in auth store).
+        if (!msg.ok && msg.error === 'unauthorized') auth.onUnauthorized()
       }
     }
   }

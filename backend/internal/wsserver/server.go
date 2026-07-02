@@ -23,6 +23,13 @@ type Server struct {
 	Snapshot *state.Snapshot
 	Commands CommandSink
 	Interval time.Duration // push interval; defaults to 100ms
+
+	// AuthorizeWrite, if set, gates command (write) messages. It is evaluated
+	// once per connection against the upgrade request — which carries the
+	// session cookie — so an unauthenticated socket can still receive the live
+	// data push but every command it sends is rejected with an "unauthorized"
+	// ack. nil => every connection may write (auth-disabled / dev posture).
+	AuthorizeWrite func(r *http.Request) bool
 }
 
 // No CheckOrigin override: gorilla's default rejects cross-origin upgrades
@@ -40,6 +47,10 @@ func (s *Server) interval() time.Duration {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Decide write permission from the session before the upgrade hijacks the
+	// request. Reads (the periodic data push) are never gated.
+	canWrite := s.AuthorizeWrite == nil || s.AuthorizeWrite(r)
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -84,7 +95,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		ack := AckMsg{Type: "ack", OK: true}
 		var cmd CmdMsg
-		if err := json.Unmarshal(raw, &cmd); err != nil {
+		if !canWrite {
+			ack.OK, ack.Error = false, "unauthorized"
+		} else if err := json.Unmarshal(raw, &cmd); err != nil {
 			ack.OK, ack.Error = false, "invalid json"
 		} else if applyErr := s.applyCmd(&cmd); applyErr != nil {
 			ack.OK, ack.Error = false, applyErr.Error()

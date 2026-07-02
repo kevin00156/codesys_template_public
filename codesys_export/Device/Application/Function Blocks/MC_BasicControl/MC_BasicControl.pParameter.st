@@ -5,5 +5,6 @@ PROPERTY pParameter : POINTER TO structAxisControl_Parameter
 VAR
 END_VAR
 
-// === IMPLEMENTATION ===
-pParameter:=ADR(THIS^.stParameter);
+// === SET ===
+VAR
+END_VAR

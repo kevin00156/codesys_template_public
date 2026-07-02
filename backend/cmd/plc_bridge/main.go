@@ -32,6 +32,14 @@ import (
 	webui "codesys_dev/frontend"
 )
 
+// defaultVendorPassword is the template's built-in fallback login, applied only
+// when no PLC_BRIDGE_*_HASH is set in the environment. It exists so a fresh
+// clone boots with a known password (the read-only dashboard stays open; only
+// machine control needs login) and the UI can nag you to change it.
+// CHANGE IT for any real deployment: mint a hash with `plc_bridge -gen-hash`
+// and set PLC_BRIDGE_PASSWORD_HASH (see README / docs/DEVELOPMENT.md §4).
+const defaultVendorPassword = "111111"
+
 func main() {
 	var (
 		modbusAddr   = flag.String("modbus", ":5020", "Modbus TCP listen address")
@@ -141,32 +149,47 @@ func serveHTTP(addr, certFile, keyFile string, ws *wsserver.Server) error {
 	}
 	mux.Handle("/", http.FileServer(http.FS(distFS)))
 
-	// Role-password auth. Hashes come from the environment (all empty => auth
-	// disabled, every route open — the dev posture). The session cookie is
-	// marked Secure only when we serve TLS.
-	authn := auth.New(
-		os.Getenv("PLC_BRIDGE_PASSWORD_HASH"), // vendor (highest tier)
-		os.Getenv("PLC_BRIDGE_TUNER_HASH"),    // tuner
-		os.Getenv("PLC_BRIDGE_OPERATOR_HASH"), // operator
-		certFile != "",
-	)
+	// Role-password auth. Hashes come from the environment; if none is set the
+	// template falls back to a built-in DEFAULT vendor password so a fresh
+	// clone runs with a known login and an on-screen "change me" nag. The
+	// session cookie is marked Secure only when we serve TLS.
+	vendorHash := os.Getenv("PLC_BRIDGE_PASSWORD_HASH")   // vendor (highest tier)
+	tunerHash := os.Getenv("PLC_BRIDGE_TUNER_HASH")       // tuner
+	operatorHash := os.Getenv("PLC_BRIDGE_OPERATOR_HASH") // operator
+	usingDefault := false
+	if vendorHash == "" && tunerHash == "" && operatorHash == "" {
+		h, err := auth.HashPassword(defaultVendorPassword)
+		if err != nil {
+			return fmt.Errorf("hash default password: %w", err)
+		}
+		vendorHash, usingDefault = h, true
+	}
+	authn := auth.New(vendorHash, tunerHash, operatorHash, certFile != "")
+	if usingDefault {
+		authn.UseDefaultPassword(defaultVendorPassword) // surfaced via /api/auth/status
+	}
 	authn.RegisterRoutes(mux) // /api/login, /api/logout, /api/auth/status — never gated
 
-	// requiredRole decides the minimum role for a request. This clean template
-	// has no gated routes yet, so it returns RoleNone (open) for everything and
-	// the login flow stays reachable. As machine APIs are added, gate their
-	// writes here, e.g.:
+	// Control commands flow over the WebSocket, not HTTP, so writes are gated
+	// there: AuthorizeWrite requires a logged-in session of any role while the
+	// read-only data push stays open to all. HTTP has no write routes yet, so
+	// requiredRole returns RoleNone (everything open) — gate machine HTTP APIs
+	// here as you add them, e.g.:
 	//
 	//	if r.Method != http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/machine/") {
 	//		return auth.RoleOperator
 	//	}
+	ws.AuthorizeWrite = authn.LoggedIn
 	requiredRole := func(r *http.Request) auth.Role { return auth.RoleNone }
 	handler := authn.Wrap(mux, requiredRole)
 
-	if authn.Enabled() {
-		log.Printf("auth enabled (vendor/tuner/operator hashes as configured)")
-	} else {
-		log.Printf("auth disabled — all routes open (set PLC_BRIDGE_*_HASH to enable)")
+	switch {
+	case usingDefault:
+		log.Printf("auth enabled with built-in DEFAULT password %q — set PLC_BRIDGE_PASSWORD_HASH to change it before production", defaultVendorPassword)
+	case authn.Enabled():
+		log.Printf("auth enabled (vendor/tuner/operator hashes from env)")
+	default:
+		log.Printf("auth disabled — all routes open")
 	}
 
 	if certFile != "" && keyFile != "" {
