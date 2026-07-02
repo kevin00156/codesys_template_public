@@ -5,5 +5,6 @@ PROPERTY pAxis : POINTER TO AXIS_REF_SM3
 VAR
 END_VAR
 
-// === IMPLEMENTATION ===
-pAxis:=ADR(THIS^.Axis);
+// === SET ===
+VAR
+END_VAR

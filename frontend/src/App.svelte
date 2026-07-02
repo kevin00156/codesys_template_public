@@ -44,10 +44,12 @@
   </div>
 </header>
 
+{#if auth.usingDefault}
+  <div class="pw-warning">{t('login.defaultBanner', { pw: auth.defaultPassword })}</div>
+{/if}
+
 {#if !auth.checked}
   <div class="waiting">…</div>
-{:else if auth.enabled && !auth.loggedIn}
-  <Login />
 {:else}
 <main>
   {#if ws.data}
@@ -116,11 +118,16 @@
     <!-- Chart (system temperature history) -->
     <PlcChart history={ws.history} />
 
-    <!-- Control -->
-    <ControlPanel />
-
   {:else}
     <div class="waiting">{ws.connected ? 'Waiting for PLC data…' : 'Connecting…'}</div>
+  {/if}
+
+  <!-- Control — the read-only dashboard above is open to everyone; operating
+       the machine requires a login. When auth is disabled loggedIn is true. -->
+  {#if auth.loggedIn}
+    <ControlPanel />
+  {:else}
+    <Login />
   {/if}
 </main>
 {/if}
@@ -139,6 +146,11 @@
   .lang { display: inline-flex; gap: 0.25rem; }
   .lang-btn { background: #374151; color: #9ca3af; border: none; border-radius: 4px; padding: 0.2rem 0.55rem; font-size: 0.75rem; cursor: pointer; }
   .lang-btn.on { background: #1d4ed8; color: #fff; }
+
+  .pw-warning {
+    padding: 0.5rem 1.5rem; font-size: 0.82rem;
+    background: #422006; color: #fbbf24; border-bottom: 1px solid #854d0e;
+  }
 
   main { padding: 1rem 1.5rem; display: flex; flex-direction: column; gap: 0.75rem; }
 

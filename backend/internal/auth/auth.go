@@ -83,6 +83,12 @@ type Authenticator struct {
 	operatorHash []byte // nil => operator-tier routes stay open (back-compat)
 	secure       bool   // mark the session cookie Secure (HTTPS only)
 
+	// defaultPassword is the plaintext of the built-in template default login,
+	// set only when the active vendor hash came from that default (no env hash
+	// configured). Non-empty => the UI shows it on the login screen and nags
+	// the operator to change it; surfaced via /api/auth/status.
+	defaultPassword string
+
 	mu     sync.Mutex
 	tokens map[string]session
 }
@@ -116,6 +122,23 @@ func (a *Authenticator) Enabled() bool {
 // configured the vendor/tuner passwords keep their HMI operator surfaces
 // working exactly as before.
 func (a *Authenticator) OperatorGated() bool { return a.operatorHash != nil }
+
+// LoggedIn reports whether the request carries a valid session of any role.
+// Used to gate write surfaces (e.g. the control panel / WebSocket commands)
+// while leaving read-only telemetry open to everyone. With auth disabled it is
+// always true.
+func (a *Authenticator) LoggedIn(r *http.Request) bool {
+	if !a.Enabled() {
+		return true
+	}
+	return a.sessionRole(r) != RoleNone
+}
+
+// UseDefaultPassword records that the active vendor hash is the built-in
+// template default with the given plaintext, so /api/auth/status can tell the
+// UI to display it and nag the operator to change it. Pass "" (the zero value)
+// when a real password is configured.
+func (a *Authenticator) UseDefaultPassword(plaintext string) { a.defaultPassword = plaintext }
 
 // HashPassword returns a bcrypt hash suitable for the *_HASH env vars.
 // Used by the plc_bridge -gen-hash helper.
@@ -159,6 +182,11 @@ func (a *Authenticator) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"loggedIn":      role != RoleNone || !a.Enabled(),
 		"role":          string(role),
 		"operatorGated": a.OperatorGated(), // mirror for the frontend's tab locks
+		// usingDefault => still on the built-in template password; defaultPassword
+		// carries its plaintext so the login screen can show it. Empty unless the
+		// default is active (a configured password is never echoed back).
+		"usingDefault":    a.defaultPassword != "",
+		"defaultPassword": a.defaultPassword,
 	})
 }
 

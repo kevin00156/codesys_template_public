@@ -46,7 +46,9 @@ WorkingDirectory=/opt/plc_bridge
 ExecStartPre=+/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/plc_data ] && [ -e /dev/shm/plc_cmd ] && break; sleep 0.5; done; chmod o+r /dev/shm/plc_data 2>/dev/null || true; chmod o+rw /dev/shm/plc_cmd 2>/dev/null || true'
 # Optional auth: drop PLC_BRIDGE_PASSWORD_HASH / PLC_BRIDGE_TUNER_HASH /
 # PLC_BRIDGE_OPERATOR_HASH (=<bcrypt hash>, mint with `plc_bridge -gen-hash`)
-# into this file to test the login flows locally. Absent => auth disabled.
+# into this file to override the built-in default password. Absent => the
+# bridge falls back to the DEFAULT password (111111, vendor): auth on, dashboard
+# open, control needs login.
 EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
 # TLS auto-enables when cert.pem/key.pem exist here (install with
 # `make wsl-deploy-certs`). No certs => plain HTTP, cookie not Secure — fine for

@@ -40,6 +40,7 @@ references/
 
 # CODESYS export sync metadata — local sync timestamps / hashes, not portable
 codesys_export/sync_metadata.json
+codesys_export/sync_cache.json
 
 *.log
 

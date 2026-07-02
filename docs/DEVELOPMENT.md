@@ -75,9 +75,17 @@
 - hash 從環境變數來：`PLC_BRIDGE_PASSWORD_HASH`（vendor）、`_TUNER_HASH`、
   `_OPERATOR_HASH`。用 `plc_bridge -gen-hash`（從 stdin 讀密碼、印 bcrypt hash）產生，
   寫進 service env file——明文永不進 args / shell history / git。
-- **全空 = auth 關閉**，每條路由全開（dev 姿態）；`/api/auth/status` 回 `enabled:false`。
+- **沒設任何 hash = 套用範本內建預設密碼 `111111`（vendor）**：auth 仍啟用，唯讀
+  儀表板開放、操作機台需登入；登入頁會直接顯示這組預設密碼並附變更步驟，頂部列
+  也會掛一條提醒。`/api/auth/status` 以 `usingDefault` / `defaultPassword` 標示。
+  正式部署務必用 `plc_bridge -gen-hash` 設 `PLC_BRIDGE_PASSWORD_HASH` 覆蓋（預設常數
+  在 [backend/cmd/plc_bridge/main.go](../backend/cmd/plc_bridge/main.go) 的 `defaultVendorPassword`）。
 - **operator 級是 opt-in**：沒設 operator hash 時，operator 級路由維持開放，舊的
   兩級部署行為不變。
+- **寫入門禁走 WebSocket**：控制指令（機台/軸/生產）經 `/ws`，由 `wsserver.Server`
+  的 `AuthorizeWrite`（= `authn.LoggedIn`）把關——未登入連線仍收得到即時資料推播，
+  但送出的指令一律回 `unauthorized` ack。前端 [App.svelte](../frontend/src/App.svelte)
+  對應地讓儀表板常開、只有 `ControlPanel` 需登入。
 - session cookie `HttpOnly` + `SameSite=Strict`；**只在 TLS 下標 `Secure`**。
 - **TLS 自動啟用**：cwd 有 `cert.pem`/`key.pem` 就走 HTTPS（systemd unit 與
   `plc_bridge` 二進位都這樣偵測）。`make cert` 產自簽憑證，`make deploy-certs` 安裝。

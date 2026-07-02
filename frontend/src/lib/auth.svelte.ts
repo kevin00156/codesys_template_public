@@ -18,6 +18,10 @@ class AuthStore {
   // 操作員級是否啟用（後端設了 PLC_BRIDGE_OPERATOR_HASH 才會把機器/訂單
   // 寫入納入門禁）。false 時主控面維持舊行為：免登入。
   operatorGated = $state(false)
+  // 是否仍在用範本內建預設密碼（後端未設任何 PLC_BRIDGE_*_HASH）。true 時登入頁
+  // 與頂部列會顯示預設密碼並提醒變更；defaultPassword 是該預設明文。
+  usingDefault    = $state(false)
+  defaultPassword = $state('')
   // 角色（意見稿 §8.3）：'' 未登入；'operator' 操作員（主控/訂單）；
   // 'tuner' 調機（+調試）；'vendor' 廠商（全開）。auth 未啟用時一律視為 vendor。
   role     = $state<'' | 'operator' | 'tuner' | 'vendor'>('')
@@ -35,10 +39,12 @@ class AuthStore {
     try {
       const res = await fetch('/api/auth/status')
       const j = await res.json()
-      this.enabled       = !!j.enabled
-      this.loggedIn      = !!j.loggedIn
-      this.operatorGated = !!j.operatorGated
-      this.role          = parseRole(j.role)
+      this.enabled         = !!j.enabled
+      this.loggedIn        = !!j.loggedIn
+      this.operatorGated   = !!j.operatorGated
+      this.usingDefault    = !!j.usingDefault
+      this.defaultPassword = typeof j.defaultPassword === 'string' ? j.defaultPassword : ''
+      this.role            = parseRole(j.role)
     } catch {
       // Backend unreachable — leave defaults (enabled=false). Nothing works in
       // that state anyway; the backend is the gate, not this flag.

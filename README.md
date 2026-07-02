@@ -83,6 +83,11 @@ make deploy-certs    # 安裝憑證到 /opt/plc_bridge/，TLS 自動啟用
 部署目標用 `.env`（從 [.env.example](.env.example) 複製）設定 `PLC_HOST` / `PLC_USER` /
 `WSL_DISTRO`，或單次 `make deploy REMOTE=user@host` 覆寫。
 
+> **登入密碼**：範本內建預設密碼 **`111111`**（唯讀儀表板免登入，操作機台才需登入；
+> 登入頁會顯示這組預設密碼與變更步驟）。**正式部署請務必變更**：用
+> `plc_bridge -gen-hash` 產生 bcrypt hash，寫進 service env file 的
+> `PLC_BRIDGE_PASSWORD_HASH`（細節見 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) §4）。
+
 ## 開發環境
 
 - 開發機（Windows + WSL）：開發、跨平台編譯（Go 在 host、frontend 在 WSL/host）

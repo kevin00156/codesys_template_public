@@ -24,8 +24,10 @@ ExecStartPre=+/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/shm/plc_data ] && [
 #   PLC_BRIDGE_TUNER_HASH=<hash>      tuner  調機  — tuning / debug-screen writes
 #   PLC_BRIDGE_OPERATOR_HASH=<hash>   operator 操作員 — routine machine writes
 #                                     (unset => those writes stay open, old behavior)
-# Leave the file absent to run with auth disabled (dev posture). The leading '-'
-# means a missing file is not an error.
+# Leave the file absent and the bridge falls back to its built-in DEFAULT
+# password (111111, vendor): auth stays on, the read-only dashboard is open and
+# only machine control needs login. CHANGE IT for production by setting
+# PLC_BRIDGE_PASSWORD_HASH above. The leading '-' means a missing file is not an error.
 EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
 # TLS auto-enables when cert.pem/key.pem exist in WorkingDirectory
 # (/opt/plc_bridge) — installed by `make deploy-certs`. No certs => plain HTTP,
