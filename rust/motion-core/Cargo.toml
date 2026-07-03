@@ -1,0 +1,10 @@
+[package]
+name = "motion-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Axis state machine with MC_BasicControl semantics + trajectory generation; bus-agnostic (talks fieldbus-api only)"
+
+[dependencies]
+fieldbus-api = { workspace = true }

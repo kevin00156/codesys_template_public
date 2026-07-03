@@ -1,0 +1,9 @@
+[package]
+name = "fieldbus-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bus-agnostic axis fieldbus abstraction: cyclic process image, acyclic parameter access, bus events, capabilities"
+
+[dependencies]

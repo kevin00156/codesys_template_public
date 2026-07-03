@@ -1,0 +1,10 @@
+[package]
+name = "fieldbus-sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Software axis model behind fieldbus-api — end-to-end validation on WSL/CI without hardware"
+
+[dependencies]
+fieldbus-api = { workspace = true }

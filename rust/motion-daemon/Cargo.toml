@@ -1,0 +1,22 @@
+[package]
+name = "motion-daemon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The CODESYS replacement binary: owns the shm segments, runs motion-core against a fieldbus backend"
+
+[[bin]]
+name = "motion-daemon"
+path = "src/main.rs"
+
+[dependencies]
+fieldbus-api = { workspace = true }
+fieldbus-ethercat = { workspace = true }
+fieldbus-sim = { workspace = true }
+motion-core = { workspace = true }
+shm-bridge = { workspace = true }
+smol = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

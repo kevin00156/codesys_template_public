@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "fieldbus-api",
+    "fieldbus-ethercat",
+    "fieldbus-sim",
+    "motion-core",
+    "motion-daemon",
+    "shm-bridge",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+
+[workspace.dependencies]
+fieldbus-api = { path = "fieldbus-api" }
+fieldbus-ethercat = { path = "fieldbus-ethercat" }
+fieldbus-sim = { path = "fieldbus-sim" }
+motion-core = { path = "motion-core" }
+shm-bridge = { path = "shm-bridge" }
+
+libc = "0.2"
+smol = "2"
+
+[profile.release]
+lto = "thin"

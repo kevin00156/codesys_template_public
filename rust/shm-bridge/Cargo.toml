@@ -1,0 +1,10 @@
+[package]
+name = "shm-bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Byte-identical mirror of backend/internal/shm: PlcData/PlcCommand layout, seqlock protocol, /dev/shm segment ownership"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

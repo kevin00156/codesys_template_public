@@ -48,6 +48,21 @@ jobs:
       - name: Cross-compile (linux/amd64 — the deploy target)
         run: GOOS=linux GOARCH=amd64 go build -o /dev/null ./backend/cmd/plc_bridge
 
+      # Rust motion daemon (rust/ workspace). Runs after the Go steps because
+      # shm-bridge's go_parity tests read the golden fixtures the Go side owns
+      # (backend/internal/shm/testdata) — Go test above proves the fixtures
+      # still match the Go encoder, cargo test proves the Rust replica agrees.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Rust build
+        working-directory: rust
+        run: cargo build --workspace --locked
+      - name: Rust test
+        working-directory: rust
+        run: cargo test --workspace --locked
+
       # Playwright e2e scaffold lives in frontend/ (playwright.config.ts + tests/)
       # and runs locally via `npm run test:e2e`. It is intentionally NOT wired
       # into CI on the clean template — add install/run/upload steps here once

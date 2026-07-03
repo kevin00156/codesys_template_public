@@ -1,0 +1,23 @@
+[package]
+name = "fieldbus-ethercat"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ethercrab adapter behind fieldbus-api — ethercrab types never leak out of this crate"
+
+[dependencies]
+fieldbus-api = { workspace = true }
+
+# ethercrab is Linux-only in this workspace: its raw-socket backends need
+# npcap/libpcap SDKs off Linux, which would break the required clean
+# `cargo build` on the Windows dev box (kickoff §4). Non-Linux builds get a
+# compile-clean stub backend; the pure logic (cia402, pdo, config) builds and
+# tests everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+ethercrab = "0.6"
+smol = { workspace = true }
+libc = { workspace = true }
+
+[[example]]
+name = "bringup"
