@@ -31,6 +31,7 @@
 //!   cb <node> <bit>             clear one OUTPUT bit
 //!   watch <node>                print a node's inputs whenever they change
 //!   watch off                   stop all watches
+//!   stats [on|off]              per-cycle exchange(scan) + period timing; 'on' auto-prints ~1s
 //!   help / q
 
 #[cfg(not(target_os = "linux"))]
@@ -136,6 +137,59 @@ mod linux {
             }
         }
         format!("[{}] {}  set-bits: {:?}", bytes.len(), hex.join(" "), set)
+    }
+
+    /// Bounded ring of latency samples (µs) for on-demand min/mean/p99/max.
+    struct Ring {
+        buf: Vec<f64>,
+        cap: usize,
+        next: usize,
+        len: usize,
+        last: f64,
+    }
+
+    impl Ring {
+        fn new(cap: usize) -> Ring {
+            Ring { buf: vec![0.0; cap], cap, next: 0, len: 0, last: 0.0 }
+        }
+        fn push(&mut self, us: f64) {
+            self.last = us;
+            self.buf[self.next] = us;
+            self.next = (self.next + 1) % self.cap;
+            if self.len < self.cap {
+                self.len += 1;
+            }
+        }
+        /// (min, mean, p99, max) over the retained window.
+        fn summary(&self) -> Option<(f64, f64, f64, f64)> {
+            if self.len == 0 {
+                return None;
+            }
+            let mut v: Vec<f64> = self.buf[..self.len].to_vec();
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            let mean = v.iter().sum::<f64>() / n as f64;
+            let p99 = v[((n - 1) as f64 * 0.99) as usize];
+            Some((v[0], mean, p99, v[n - 1]))
+        }
+    }
+
+    fn fmt_stats(xchg: &Ring, period: &Ring, target_us: f64, cycles: usize) -> String {
+        let fx = |r: &Ring| match r.summary() {
+            Some((mn, me, p9, mx)) => {
+                format!("min={mn:7.1} mean={me:7.1} p99={p9:7.1} max={mx:7.1}µs  (n={})", r.len)
+            }
+            None => "no samples yet".to_string(),
+        };
+        format!(
+            "stats @ {cycles} cycles, target {target_us:.0}µs:\n  \
+             exchange(scan): last={:.1}µs  {}\n  \
+             cycle period:   {}\n  \
+             note: no RT scheduling here — a systemd unit with SCHED_FIFO on isolcpus is much tighter",
+            xchg.last,
+            fx(xchg),
+            fx(period),
+        )
     }
 
     pub fn main() {
@@ -270,7 +324,7 @@ mod linux {
 
         print_nodes(&nodes);
         eprintln!(
-            "\ncommands: ls | ri <n> | ro <n> | wo <n> <off> <byte...> | sb/cb <n> <bit> | watch <n> | watch off | q"
+            "\ncommands: ls | ri <n> | ro <n> | wo <n> <off> <byte...> | sb/cb <n> <bit> | watch <n> | stats [on|off] | q"
         );
         eprintln!("writing an output drives a REAL terminal. CT-drive outputs are locked to 0.\n");
 
@@ -300,9 +354,23 @@ mod linux {
         let mut next = Instant::now() + args.cycle;
         let mut running = true;
         let mut offline_warned = false;
+        let mut xchg = Ring::new(4096);
+        let mut period = Ring::new(4096);
+        let mut last_wake: Option<Instant> = None;
+        let mut cycles: usize = 0;
+        let mut auto_stats = false;
+        let mut last_stats = Instant::now();
+        let target_us = args.cycle.as_secs_f64() * 1e6;
         while running {
             smol::Timer::at(next).await;
             next += args.cycle;
+
+            let woke = Instant::now();
+            if let Some(prev) = last_wake {
+                period.push((woke - prev).as_secs_f64() * 1e6);
+            }
+            last_wake = Some(woke);
+            cycles += 1;
 
             // 1. drive outputs (desired image; CT nodes stay all-zero forever)
             for node in 0..n {
@@ -315,7 +383,8 @@ mod linux {
                 }
             }
 
-            // 2. exchange
+            // 2. exchange — time the round-trip (the "single scan" duration)
+            let t_ex = Instant::now();
             match group.tx_rx(&maindevice).await {
                 Ok(r) => {
                     let ok = r.is_in_state(SubDeviceState::Op);
@@ -331,6 +400,7 @@ mod linux {
                     continue;
                 }
             }
+            xchg.push(t_ex.elapsed().as_secs_f64() * 1e6);
 
             // 3. read fresh inputs
             for node in 0..n {
@@ -360,12 +430,33 @@ mod linux {
                     continue;
                 }
                 let tok: Vec<&str> = cmd.split_whitespace().collect();
+                // `stats` lives here (needs the timing rings this loop owns).
+                if tok[0] == "stats" {
+                    match tok.get(1).copied() {
+                        Some("on") => {
+                            auto_stats = true;
+                            println!("stats: auto-print on (~1s) — 'stats off' to stop");
+                        }
+                        Some("off") => {
+                            auto_stats = false;
+                            println!("stats: auto-print off");
+                        }
+                        _ => println!("{}", fmt_stats(&xchg, &period, target_us, cycles)),
+                    }
+                    continue;
+                }
                 match handle(&tok, &nodes, &in_snap, &mut out_desired, &mut watch, &mut last_watch) {
                     Ok(Some(msg)) => println!("{msg}"),
                     Ok(None) => {}
                     Err(Cmd::Quit) => running = false,
                     Err(Cmd::Msg(e)) => println!("pdo: {e}"),
                 }
+            }
+
+            // 6. periodic stats auto-print
+            if auto_stats && last_stats.elapsed() >= Duration::from_secs(1) {
+                println!("{}", fmt_stats(&xchg, &period, target_us, cycles));
+                last_stats = Instant::now();
             }
         }
 
@@ -545,5 +636,6 @@ mod linux {
         sb <node> <bit>             set   one output bit (bit = off*8 + bitInByte)\n  \
         cb <node> <bit>             clear one output bit\n  \
         watch <node> | watch off    print inputs on change / stop\n  \
+        stats [on|off]              exchange(scan) + cycle-period timing; 'on' auto-prints ~1s\n  \
         q                           quit (zeroes outputs first)";
 }
