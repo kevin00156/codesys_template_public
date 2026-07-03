@@ -174,7 +174,11 @@ mod linux {
             if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
                 eprintln!("bringup: mlockall failed (running without memory lock)");
             }
-            let param = libc::sched_param { sched_priority: 80 };
+            // zeroed(), not a field literal: musl's sched_param carries extra
+            // sched_ss_* (sporadic server) fields that glibc's does not, so a
+            // `{ sched_priority: 80 }` literal fails to compile against musl.
+            let mut param: libc::sched_param = std::mem::zeroed();
+            param.sched_priority = 80;
             if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
                 eprintln!("bringup: SCHED_FIFO failed (running with normal scheduling)");
             }

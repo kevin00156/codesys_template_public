@@ -18,6 +18,16 @@ fieldbus-api = { workspace = true }
 ethercrab = "0.6"
 smol = { workspace = true }
 libc = { workspace = true }
+# Only the `sdo` bring-up console needs heapless directly (String/Vec targets
+# for variable-length CoE reads); pinned to ethercrab-wire's 0.8 so the wire
+# trait impls apply to the same heapless types.
+heapless = "0.8"
 
 [[example]]
 name = "bringup"
+
+[[example]]
+name = "sdo"
+
+[[example]]
+name = "pdo"

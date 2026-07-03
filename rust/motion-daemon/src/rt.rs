@@ -53,9 +53,13 @@ mod imp {
     /// SCHED_FIFO for the calling thread (Phase 3 EtherCAT cycle thread).
     #[allow(dead_code)]
     pub fn set_fifo(priority: i32) -> io::Result<()> {
-        let param = libc::sched_param {
-            sched_priority: priority,
-        };
+        // zeroed(), not a field literal: musl's sched_param carries extra
+        // sched_ss_* (sporadic server) fields that glibc's does not, so a
+        // field literal fails to compile against musl (the real IPC binary is
+        // built static-musl for glibc-independence).
+        // Safety: sched_param is a plain integer POSIX struct; all-zero is valid.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = priority;
         // Safety: param outlives the call.
         if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
             return Err(io::Error::last_os_error());
