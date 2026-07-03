@@ -200,10 +200,10 @@ mod linux {
                 std::process::exit(2);
             }
         };
-        std::process::exit(smol::block_on(run(args)));
+        std::process::exit(run(args));
     }
 
-    async fn run(args: Args) -> i32 {
+    fn run(args: Args) -> i32 {
         let storage: &'static Storage = Box::leak(Box::new(Storage::new()));
         let (tx, rx, pdu_loop) = match storage.try_split() {
             Ok(p) => p,
@@ -230,19 +230,23 @@ mod linux {
                 return 1;
             }
         };
-        if std::thread::Builder::new()
-            .name("ecat-txrx".into())
-            .spawn(move || {
-                if let Err(e) = smol::block_on(txrx) {
-                    eprintln!("pdo: tx/rx task exited: {e}");
-                }
-            })
-            .is_err()
-        {
-            eprintln!("pdo: spawn tx/rx thread failed");
-            return 1;
-        }
+        // Single-threaded I/O: drive the tx/rx task and the cyclic loop on ONE
+        // LocalExecutor so the cyclic task polls tx/rx inline on the same thread
+        // — no cross-thread wakeup (that handoff was the ~245µs saturation floor
+        // of the previous spawn-a-thread design). One thread pinned to one
+        // isolated core is also the cleanest RT story.
+        let ex = smol::LocalExecutor::new();
+        ex.spawn(async move {
+            if let Err(e) = txrx.await {
+                eprintln!("pdo: tx/rx task exited: {e}");
+            }
+        })
+        .detach();
 
+        smol::block_on(ex.run(drive(&maindevice, &args)))
+    }
+
+    async fn drive(maindevice: &MainDevice<'static>, args: &Args) -> i32 {
         // Scan (PREOP), then bring the whole group to OP on default PDO — no
         // 402 config written, mirroring `bringup --axes 0 --no-dc`.
         let group = match maindevice
@@ -257,14 +261,14 @@ mod linux {
         };
         eprintln!("pdo: {} subdevice(s) on {}", group.len(), args.ifname);
 
-        let group = match group.into_pre_op_pdi(&maindevice).await {
+        let group = match group.into_pre_op_pdi(maindevice).await {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("pdo: configure PDI: {e}");
                 return 1;
             }
         };
-        let group = match group.request_into_op(&maindevice).await {
+        let group = match group.request_into_op(maindevice).await {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("pdo: request OP: {e}");
@@ -275,7 +279,7 @@ mod linux {
         // Drive the cycle until every subdevice reports OP (bounded).
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            match group.tx_rx(&maindevice).await {
+            match group.tx_rx(maindevice).await {
                 Ok(r) => {
                     if r.is_in_state(SubDeviceState::Op) {
                         break;
@@ -298,7 +302,7 @@ mod linux {
         let n = group.len();
         let mut nodes: Vec<Node> = Vec::with_capacity(n);
         for node in 0..n {
-            let sd = match group.subdevice(&maindevice, node) {
+            let sd = match group.subdevice(maindevice, node) {
                 Ok(sd) => sd,
                 Err(e) => {
                     eprintln!("pdo: node {node}: {e}");
@@ -374,7 +378,7 @@ mod linux {
 
             // 1. drive outputs (desired image; CT nodes stay all-zero forever)
             for node in 0..n {
-                if let Ok(sd) = group.subdevice(&maindevice, node) {
+                if let Ok(sd) = group.subdevice(maindevice, node) {
                     let mut io = sd.io_raw_mut();
                     let out = io.outputs();
                     if !out.is_empty() {
@@ -385,7 +389,7 @@ mod linux {
 
             // 2. exchange — time the round-trip (the "single scan" duration)
             let t_ex = Instant::now();
-            match group.tx_rx(&maindevice).await {
+            match group.tx_rx(maindevice).await {
                 Ok(r) => {
                     let ok = r.is_in_state(SubDeviceState::Op);
                     if !ok && !offline_warned {
@@ -404,7 +408,7 @@ mod linux {
 
             // 3. read fresh inputs
             for node in 0..n {
-                if let Ok(sd) = group.subdevice(&maindevice, node) {
+                if let Ok(sd) = group.subdevice(maindevice, node) {
                     let io = sd.io_raw();
                     let inp = io.inputs();
                     if !inp.is_empty() {
@@ -467,7 +471,7 @@ mod linux {
         }
         for _ in 0..5 {
             for node in 0..n {
-                if let Ok(sd) = group.subdevice(&maindevice, node) {
+                if let Ok(sd) = group.subdevice(maindevice, node) {
                     let mut io = sd.io_raw_mut();
                     let out = io.outputs();
                     if !out.is_empty() {
@@ -475,7 +479,7 @@ mod linux {
                     }
                 }
             }
-            let _ = group.tx_rx(&maindevice).await;
+            let _ = group.tx_rx(maindevice).await;
             smol::Timer::after(args.cycle).await;
         }
         0
