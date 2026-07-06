@@ -7,16 +7,20 @@
 //! * [`mapping`] — /dev/shm segment creation (Linux) or in-memory buffers.
 //! * [`channel`] — `DataPublisher` / `CmdReader` with the IEC program's
 //!   command-latching semantics.
+//! * [`trace`] — the `plc_trace` broadcast ring (one fixed sample per cycle)
+//!   behind the HMI's watch/trace panels.
 
 pub mod channel;
 pub mod layout;
 pub mod mapping;
 pub mod seqlock;
+pub mod trace;
 
 pub use channel::{CmdReader, DataPublisher};
 pub use layout::*;
 pub use mapping::Mapping;
 pub use seqlock::{publish, snapshot, ReadError, SEQLOCK_MAX_RETRIES};
+pub use trace::{TraceAxisSample, TraceHeader, TraceReader, TraceSample, TraceWriter};
 
 #[cfg(test)]
 mod tests {

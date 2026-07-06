@@ -105,3 +105,38 @@ func TestGoldenPlcCommand(t *testing.T) {
 	b := unsafe.Slice((*byte)(unsafe.Pointer(&c)), SizePlcCommand)
 	checkGolden(t, "plc_cmd_v3.bin", b)
 }
+
+// goldenTraceSample fills every TraceSample field with a distinct value; the
+// Rust parity test builds the identical struct from the same formulas.
+func goldenTraceSample() TraceSample {
+	var s TraceSample
+	s.Cycle = 0x1122334455667788
+	s.TMonoNs = 0x0102030405060708
+	s.PeriodNs = 2_000_123
+	s.ExchangeNs = 123_456
+	s.BusState = 3
+	s.StatusBits = 0b101
+	s.RunState = 0x00C0FFEE
+	for i := range s.Axes {
+		f := float64(i)
+		s.Axes[i] = TraceAxisSample{
+			ActPos:      1.5 + 100*f,
+			ActVel:      -2.25 + 100*f,
+			SetPos:      3.125 + 100*f,
+			SetVel:      -4.0625 + 100*f,
+			Step:        int32(10 + i),
+			Flags:       uint32(0x21 + i),
+			ErrorID:     int32(-(100 + i)),
+			FaultCode:   uint32(0x8000 + i),
+			DriveStatus: uint32(i + 1),
+			IOBits:      uint32(0x11 + i),
+		}
+	}
+	return s
+}
+
+func TestGoldenTraceSample(t *testing.T) {
+	s := goldenTraceSample()
+	b := unsafe.Slice((*byte)(unsafe.Pointer(&s)), SizeTraceSample)
+	checkGolden(t, "plc_trace_v1.bin", b)
+}

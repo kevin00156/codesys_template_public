@@ -6,6 +6,8 @@
   import Login from './lib/Login.svelte'
   import PlcChart from './lib/PlcChart.svelte'
   import ControlPanel from './lib/ControlPanel.svelte'
+  import WatchPanel from './lib/WatchPanel.svelte'
+  import TracePanel from './lib/TracePanel.svelte'
 
   onMount(() => {
     auth.checkStatus() // is auth on, and are we already logged in?
@@ -117,6 +119,11 @@
 
     <!-- Chart (system temperature history) -->
     <PlcChart history={ws.history} />
+
+    <!-- Debugging: daemon-internals watch + per-cycle trace oscilloscope -->
+    <section class="group-label">Diagnostics</section>
+    <WatchPanel />
+    <TracePanel />
 
   {:else}
     <div class="waiting">{ws.connected ? 'Waiting for PLC data…' : 'Connecting…'}</div>

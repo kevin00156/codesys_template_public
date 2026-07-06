@@ -30,6 +30,8 @@ pub struct Config {
     pub ecat_dc: bool,
     /// Chain position of the first axis drive (couplers before it shift this).
     pub first_axis_subdevice: usize,
+    /// Ring window of the /dev/shm trace segment, seconds (0 = trace off).
+    pub trace_seconds: u64,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             scale: 10_000.0,
             ecat_dc: true,
             first_axis_subdevice: 0,
+            trace_seconds: 60,
         }
     }
 }
@@ -91,6 +94,10 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Config, String> {
                 set(&mut cfg, "ifname", val("--ifname")?)?;
                 it.next();
             }
+            "--trace-seconds" => {
+                set(&mut cfg, "trace_seconds", val("--trace-seconds")?)?;
+                it.next();
+            }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
         }
@@ -102,13 +109,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Config, String> {
     if cfg.cycle < Duration::from_micros(250) || cfg.cycle > Duration::from_secs(1) {
         return Err(format!("cycle out of range: {:?}", cfg.cycle));
     }
+    // 600 s @ 250 µs is already a 1 GiB ring — past that you want files,
+    // not /dev/shm.
+    if cfg.trace_seconds > 600 {
+        return Err(format!(
+            "trace_seconds must be 0..=600, got {}",
+            cfg.trace_seconds
+        ));
+    }
     Ok(cfg)
 }
 
 pub const USAGE: &str = "usage: motion-daemon [--config FILE] [--backend sim|ethercat] \
-[--axes N] [--cycle-ms MS] [--ifname IF]\n\
+[--axes N] [--cycle-ms MS] [--ifname IF] [--trace-seconds S]\n\
 config file keys: backend, axes, cycle_ms, ifname, max_vel, acc, dec, stop_dec, sim_tau_ms,\n\
-                  scale, ecat_dc, first_axis_subdevice";
+                  scale, ecat_dc, first_axis_subdevice, trace_seconds";
 
 fn apply_file(cfg: &mut Config, text: &str) -> Result<(), String> {
     for (lineno, line) in text.lines().enumerate() {
@@ -149,6 +164,7 @@ fn set(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "scale" => cfg.scale = num(key, value)?,
         "ecat_dc" => cfg.ecat_dc = value == "true" || value == "1",
         "first_axis_subdevice" => cfg.first_axis_subdevice = num(key, value)? as usize,
+        "trace_seconds" => cfg.trace_seconds = num(key, value)? as u64,
         _ => return Err(format!("unknown key {key}")),
     }
     Ok(())
@@ -178,6 +194,17 @@ mod tests {
         assert!(parse(argv("--backend plc")).is_err());
         assert!(parse(argv("--axes 9")).is_err());
         assert!(parse(argv("--frobnicate")).is_err());
+        assert!(parse(argv("--trace-seconds 601")).is_err());
+    }
+
+    #[test]
+    fn trace_seconds_flag() {
+        assert_eq!(parse(argv("")).unwrap().trace_seconds, 60);
+        assert_eq!(parse(argv("--trace-seconds 0")).unwrap().trace_seconds, 0);
+        assert_eq!(
+            parse(argv("--trace-seconds 120")).unwrap().trace_seconds,
+            120
+        );
     }
 
     #[test]

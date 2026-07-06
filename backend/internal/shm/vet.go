@@ -29,4 +29,20 @@ const (
 
 	_ = uint(168 - unsafe.Sizeof(PlcCommand{}))
 	_ = uint(unsafe.Sizeof(PlcCommand{}) - 168)
+
+	_ = uint(64 - unsafe.Sizeof(TraceHeader{}))
+	_ = uint(unsafe.Sizeof(TraceHeader{}) - 64)
+
+	_ = uint(56 - unsafe.Sizeof(TraceAxisSample{}))
+	_ = uint(unsafe.Sizeof(TraceAxisSample{}) - 56)
+
+	_ = uint(256 - unsafe.Sizeof(TraceSample{}))
+	_ = uint(unsafe.Sizeof(TraceSample{}) - 256)
+
+	// The ring reader loads WriteIdx atomically through this offset.
+	_ = uint(32 - unsafe.Offsetof(TraceHeader{}.WriteIdx))
+	_ = uint(unsafe.Offsetof(TraceHeader{}.WriteIdx) - 32)
+
+	_ = uint(32 - unsafe.Offsetof(TraceSample{}.Axes))
+	_ = uint(unsafe.Offsetof(TraceSample{}.Axes) - 32)
 )

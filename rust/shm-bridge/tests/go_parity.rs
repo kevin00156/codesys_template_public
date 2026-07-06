@@ -6,6 +6,7 @@
 //! bump).
 
 use shm_bridge::layout::{self, AxisCmd, AxisState, Header, PlcCommand, PlcData};
+use shm_bridge::trace::{self, TraceAxisSample, TraceSample};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../backend/internal/shm/testdata");
@@ -98,4 +99,46 @@ fn plc_command_matches_go_bytes() {
     assert_eq!(decoded, golden_cmd());
 
     assert_eq!(layout::as_bytes(&golden_cmd()), &bytes[..]);
+}
+
+/// Same formulas as Go's goldenTraceSample().
+fn golden_trace_sample() -> TraceSample {
+    let mut s = TraceSample {
+        cycle: 0x1122_3344_5566_7788,
+        t_mono_ns: 0x0102_0304_0506_0708,
+        period_ns: 2_000_123,
+        exchange_ns: 123_456,
+        bus_state: 3,
+        status_bits: 0b101,
+        _pad: 0,
+        run_state: 0x00C0_FFEE,
+        axes: Default::default(),
+    };
+    for (i, ax) in s.axes.iter_mut().enumerate() {
+        let f = i as f64;
+        *ax = TraceAxisSample {
+            act_pos: 1.5 + 100.0 * f,
+            act_vel: -2.25 + 100.0 * f,
+            set_pos: 3.125 + 100.0 * f,
+            set_vel: -4.0625 + 100.0 * f,
+            step: 10 + i as i32,
+            flags: 0x21 + i as u32,
+            error_id: -(100 + i as i32),
+            fault_code: 0x8000 + i as u32,
+            drive_status: i as u32 + 1,
+            io_bits: 0x11 + i as u32,
+        };
+    }
+    s
+}
+
+#[test]
+fn trace_sample_matches_go_bytes() {
+    let bytes = fixture("plc_trace_v1.bin");
+    assert_eq!(bytes.len(), trace::SIZE_TRACE_SAMPLE);
+
+    let decoded = trace::sample_from_bytes(&bytes);
+    assert_eq!(decoded, golden_trace_sample());
+
+    assert_eq!(trace::sample_as_bytes(&golden_trace_sample()), &bytes[..]);
 }

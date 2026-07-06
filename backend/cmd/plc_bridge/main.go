@@ -28,6 +28,7 @@ import (
 	"codesys_dev/backend/internal/modbus"
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
+	"codesys_dev/backend/internal/traceapi"
 	"codesys_dev/backend/internal/wsserver"
 	webui "codesys_dev/frontend"
 )
@@ -142,6 +143,11 @@ func main() {
 func serveHTTP(addr, certFile, keyFile string, ws *wsserver.Server) error {
 	mux := http.NewServeMux()
 	mux.Handle("/ws", ws)
+
+	// Watch/trace endpoints over the daemon's plc_trace ring. Lazy and
+	// optional: a daemon without --trace-seconds (or an older build) just
+	// makes these return 503, it never blocks the bridge.
+	traceapi.New().Register(mux)
 
 	distFS, err := fs.Sub(webui.Files, "dist")
 	if err != nil {
