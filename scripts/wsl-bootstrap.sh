@@ -25,6 +25,8 @@ sudo mkdir -p /opt/plc_bridge
 sudo chown plc_bridge:plc_bridge /opt/plc_bridge
 
 echo "[bootstrap] systemd unit /etc/systemd/system/plc_bridge.service"
+# WSL flavour of scripts/plc_bridge.service.unit — keep the two in sync when
+# editing shared lines.
 sudo tee /etc/systemd/system/plc_bridge.service >/dev/null <<'UNIT'
 [Unit]
 Description=plc_bridge — PLC shm reader + Modbus TCP slave + HTTP API
@@ -53,7 +55,9 @@ EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
 # TLS auto-enables when cert.pem/key.pem exist here (install with
 # `make wsl-deploy-certs`). No certs => plain HTTP, cookie not Secure — fine for
 # a local dev box, never for production.
-ExecStart=/opt/plc_bridge/plc_bridge --modbus=:5020
+# Modbus defaults to 127.0.0.1:5020 — the write map has no authentication.
+# Expose it deliberately with --modbus=:5020 only on a firewalled machine network.
+ExecStart=/opt/plc_bridge/plc_bridge
 Restart=on-failure
 RestartSec=2
 
