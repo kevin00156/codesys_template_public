@@ -16,6 +16,15 @@ const seqlockMaxRetries = 100
 // ReadPlcData copies the segment into dst under the seqlock protocol.
 // On success, dst.Header.Magic and dst.Header.Version are guaranteed
 // to match this build's expectations.
+//
+// Memory-ordering caveat: only Header.Seq is accessed atomically; the payload
+// is a plain bulk copy. Go's atomics give acquire/release ordering, but
+// nothing stops the hardware from reordering the payload's plain loads past
+// the second seq load — that requires a read fence Go does not expose. On
+// x86/amd64 (TSO: loads are not reordered with loads) this is sound, and
+// amd64 is the only deploy target (Makefile GOARCH). Porting to ARM needs a
+// fence or per-word atomic copies. The Seq accesses themselves must stay
+// atomic: they also prevent the compiler from reordering across them.
 func ReadPlcData(m *Mapping, dst *PlcData) error {
 	src := (*PlcData)(m.Ptr())
 	for i := 0; i < seqlockMaxRetries; i++ {
