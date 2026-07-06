@@ -12,6 +12,11 @@ import "sync/atomic"
 // written, so a reader could latch a torn snapshot. We force the copied seq
 // to the in-progress (odd) value to keep the seqlock invariant: seq stays
 // odd for the entire time the payload is in flux.
+//
+// Memory-ordering caveat: the payload copy is plain stores between the two
+// atomic seq stores. Sound on x86/amd64 (TSO: stores are not reordered with
+// stores), which is the only deploy target — see the matching note on
+// ReadPlcData before porting to ARM.
 func WritePlcCommand(m *Mapping, src *PlcCommand) {
 	dst := (*PlcCommand)(m.Ptr())
 	s := atomic.LoadUint32(&dst.Header.Seq)

@@ -5,7 +5,7 @@
 #
 # Tight allowlist — only the exact commands shm-reset.sh invokes, no wildcards.
 # If you change PLC_USER, edit the username here too.
-plc ALL=(root) NOPASSWD: /bin/systemctl stop plc_bridge, /bin/systemctl start plc_bridge, /bin/systemctl is-active plc_bridge, /bin/systemctl reset-failed plc_bridge
-plc ALL=(root) NOPASSWD: /bin/systemctl stop codesyscontrol, /bin/systemctl start codesyscontrol
-plc ALL=(root) NOPASSWD: /bin/rm -f /dev/shm/plc_cmd /dev/shm/plc_data
+plc ALL=(root) NOPASSWD: /usr/bin/systemctl stop plc_bridge, /usr/bin/systemctl start plc_bridge, /usr/bin/systemctl is-active plc_bridge, /usr/bin/systemctl reset-failed plc_bridge
+plc ALL=(root) NOPASSWD: /usr/bin/systemctl stop codesyscontrol, /usr/bin/systemctl start codesyscontrol
+plc ALL=(root) NOPASSWD: /usr/bin/rm -f /dev/shm/plc_cmd /dev/shm/plc_data
 plc ALL=(root) NOPASSWD: /usr/bin/journalctl -u plc_bridge -n 20 --no-pager
