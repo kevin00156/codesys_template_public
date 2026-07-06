@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"codesys_dev/backend/internal/auth"
+	"codesys_dev/backend/internal/cmdsink"
 	"codesys_dev/backend/internal/modbus"
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
@@ -48,6 +49,7 @@ func main() {
 		tlsKey       = flag.String("tls-key", "", "TLS private key file (auto-detected from ./key.pem if empty)")
 		pollInterval = flag.Duration("poll", 10*time.Millisecond, "shm poll interval")
 		pushInterval = flag.Duration("push", 100*time.Millisecond, "WebSocket push interval")
+		jogTimeout   = flag.Duration("jog-timeout", 500*time.Millisecond, "dead-man timeout: jog bits not refreshed within this window are cleared")
 		genHash      = flag.Bool("gen-hash", false, "read a password from stdin, print its bcrypt hash for the PLC_BRIDGE_*_HASH env vars, then exit")
 	)
 	flag.Parse()
@@ -87,10 +89,15 @@ func main() {
 	defer cmdMap.Close()
 
 	snap := &state.Snapshot{}
-	sink := newCmdSink(cmdMap)
+	sink := cmdsink.New(func(c *shm.PlcCommand) { shm.WritePlcCommand(cmdMap, c) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Dead-man for the level-held jog bits: clients (HMI, Modbus master) must
+	// re-send jog commands periodically; bits that stop being refreshed are
+	// cleared so a vanished client can't leave an axis moving.
+	sink.StartJogWatchdog(ctx, *jogTimeout)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -232,34 +239,4 @@ func pollShm(ctx context.Context, m *shm.Mapping, snap *state.Snapshot, interval
 			snap.Update(&d)
 		}
 	}
-}
-
-// cmdSink serialises Modbus writes and pushes the latest command to
-// /dev/shm/plc_cmd. Atomic-ish semantics: a closure that returns
-// non-nil error rolls back any field mutations it made, so a rejected
-// partial write never reaches the PLC.
-type cmdSink struct {
-	mu      sync.Mutex
-	mapping *shm.Mapping
-	pending shm.PlcCommand
-}
-
-func newCmdSink(m *shm.Mapping) *cmdSink {
-	c := &cmdSink{mapping: m}
-	c.pending.Header.Magic   = shm.PlcCommandMagic
-	c.pending.Header.Version = shm.PlcCommandVersion
-	return c
-}
-
-func (c *cmdSink) Apply(fn func(*shm.PlcCommand) error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	saved := c.pending
-	if err := fn(&c.pending); err != nil {
-		c.pending = saved
-		return err
-	}
-	c.pending.Header.Cycle++
-	shm.WritePlcCommand(c.mapping, &c.pending)
-	return nil
 }

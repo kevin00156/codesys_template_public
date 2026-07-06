@@ -74,6 +74,15 @@ type AxisCmd struct {
 	MoveAbsVel   float64 // MoveAbsolute velocity
 }
 
+// AxisCmd.ControlFlags bits. The command word is level-held — the PLC acts on
+// whatever is set each cycle — so a jog bit left behind by a vanished client
+// keeps the axis moving. The jog watchdog in internal/cmdsink clears these two
+// when they stop being refreshed.
+const (
+	AxisCtrlJogPos uint32 = 1 << 4
+	AxisCtrlJogNeg uint32 = 1 << 5
+)
+
 // MachineCmd carries HMI commands for the whole machine.
 // 136 bytes.
 type MachineCmd struct {
