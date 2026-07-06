@@ -1,3 +1,5 @@
+# Production unit. A WSL flavour of this unit lives in scripts/wsl-bootstrap.sh
+# (heredoc) — keep the two in sync when editing shared lines.
 [Unit]
 Description=plc_bridge — PLC shm reader + Modbus TCP slave + HTTP API
 After=network-online.target codesyscontrol.service
@@ -33,7 +35,9 @@ EnvironmentFile=-/opt/plc_bridge/plc_bridge.env
 # (/opt/plc_bridge) — installed by `make deploy-certs`. No certs => plain HTTP,
 # over which the password and session cookie travel in clear; install certs for
 # production. Dropping them in and restarting is enough; no flag change needed.
-ExecStart=/opt/plc_bridge/plc_bridge --modbus=:5020
+# Modbus defaults to 127.0.0.1:5020 — the write map has no authentication.
+# Expose it deliberately with --modbus=:5020 only on a firewalled machine network.
+ExecStart=/opt/plc_bridge/plc_bridge
 Restart=on-failure
 RestartSec=2
 

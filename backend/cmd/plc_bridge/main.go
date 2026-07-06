@@ -42,7 +42,7 @@ const defaultVendorPassword = "111111"
 
 func main() {
 	var (
-		modbusAddr   = flag.String("modbus", ":5020", "Modbus TCP listen address")
+		modbusAddr   = flag.String("modbus", "127.0.0.1:5020", "Modbus TCP listen address; the Modbus write map has no authentication, so bind a non-loopback address (e.g. :5020) only on a firewalled/dedicated machine network")
 		httpAddr     = flag.String("http", ":8443", "HTTP/WebSocket listen address")
 		tlsCert      = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS; auto-detected from ./cert.pem if empty)")
 		tlsKey       = flag.String("tls-key", "", "TLS private key file (auto-detected from ./key.pem if empty)")
