@@ -4,9 +4,9 @@
 // Word ordering: big-endian (high word at lower address).
 //
 // Adding a register:
-//   1. pick the next free address (mind field width)
-//   2. add an Addr* constant
-//   3. add a line to EncodeData (read) or commandFields (write)
+//  1. pick the next free address (mind field width)
+//  2. add an Addr* constant
+//  3. add a line to EncodeData (read) or commandFields (write)
 package modbus
 
 import (

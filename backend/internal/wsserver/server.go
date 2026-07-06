@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
+	"github.com/gorilla/websocket"
 )
 
 // CommandSink is the same interface used by the Modbus server.
@@ -159,9 +159,9 @@ func (s *Server) applyCmd(cmd *CmdMsg) error {
 			if cmd.AxisIndex >= 0 && cmd.AxisIndex < 4 {
 				a := &c.Machine.Axes[cmd.AxisIndex]
 				a.ControlFlags = cmd.AxisFlags
-				a.JogVel       = cmd.JogVel
-				a.MoveAbsPos   = cmd.MoveAbsPos
-				a.MoveAbsVel   = cmd.MoveAbsVel
+				a.JogVel = cmd.JogVel
+				a.MoveAbsPos = cmd.MoveAbsPos
+				a.MoveAbsVel = cmd.MoveAbsVel
 			}
 		case "production":
 			c.Production.NProductionState = cmd.NProductionState
