@@ -59,11 +59,11 @@ type CmdMsg struct {
 	ControlFlags uint32 `json:"controlFlags"`
 
 	// "axis": per-axis command
-	AxisIndex    int     `json:"axisIndex"`
-	AxisFlags    uint32  `json:"axisFlags"`
-	JogVel       float64 `json:"jogVel"`
-	MoveAbsPos   float64 `json:"moveAbsPos"`
-	MoveAbsVel   float64 `json:"moveAbsVel"`
+	AxisIndex  int     `json:"axisIndex"`
+	AxisFlags  uint32  `json:"axisFlags"`
+	JogVel     float64 `json:"jogVel"`
+	MoveAbsPos float64 `json:"moveAbsPos"`
+	MoveAbsVel float64 `json:"moveAbsVel"`
 
 	// "production"
 	NProductionState int32 `json:"nProductionState"`
