@@ -50,6 +50,7 @@ func main() {
 		pollInterval = flag.Duration("poll", 10*time.Millisecond, "shm poll interval")
 		pushInterval = flag.Duration("push", 100*time.Millisecond, "WebSocket push interval")
 		jogTimeout   = flag.Duration("jog-timeout", 500*time.Millisecond, "dead-man timeout: jog bits not refreshed within this window are cleared")
+		staleAfter   = flag.Duration("stale-after", 500*time.Millisecond, "snapshot age past which data is flagged stale (WS) / reads fail (Modbus)")
 		genHash      = flag.Bool("gen-hash", false, "read a password from stdin, print its bcrypt hash for the PLC_BRIDGE_*_HASH env vars, then exit")
 	)
 	flag.Parse()
@@ -107,7 +108,7 @@ func main() {
 	}()
 
 	// Modbus TCP server.
-	srv := &modbus.Server{Snapshot: snap, Commands: sink}
+	srv := &modbus.Server{Snapshot: snap, Commands: sink, StaleAfter: *staleAfter}
 	go func() {
 		if err := srv.ListenAndServe(*modbusAddr); err != nil {
 			log.Printf("modbus: %v", err)
@@ -117,9 +118,10 @@ func main() {
 
 	// HTTP/HTTPS server: WebSocket API + embedded frontend.
 	wsSrv := &wsserver.Server{
-		Snapshot: snap,
-		Commands: sink,
-		Interval: *pushInterval,
+		Snapshot:   snap,
+		Commands:   sink,
+		Interval:   *pushInterval,
+		StaleAfter: *staleAfter,
 	}
 	go func() {
 		if err := serveHTTP(*httpAddr, certFile, keyFile, wsSrv); err != nil {
