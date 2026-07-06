@@ -15,6 +15,43 @@
       prodSynced = true
     }
   })
+
+  // Jog dead-man, browser side. The backend clears jog bits not refreshed
+  // within its -jog-timeout window, so while a jog button is held we re-send
+  // the command every 250ms; every release path (pointerup, pointercancel,
+  // capture loss, WS drop, unmount) sends stop and ends the refresh.
+  const JOG_RESEND_MS = 250
+  let jogTimer: ReturnType<typeof setInterval> | null = null
+  let jogAxis = 0
+
+  function startJog(e: PointerEvent, flags: number) {
+    // Capture the pointer so release outside the button still fires pointerup.
+    ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    stopJog()
+    jogAxis = selAxis
+    const axis = jogAxis
+    const send = () => ws.sendAxisCmd(axis, flags, jogVel)
+    send()
+    jogTimer = setInterval(send, JOG_RESEND_MS)
+  }
+
+  function stopJog() {
+    if (jogTimer === null) return
+    clearInterval(jogTimer)
+    jogTimer = null
+    ws.sendAxisCmd(jogAxis, 0)
+  }
+
+  // WS drop: stop resending immediately; the backend watchdog clears the
+  // level-held jog bits since our keepalives no longer arrive.
+  $effect(() => {
+    if (!ws.connected && jogTimer !== null) {
+      clearInterval(jogTimer)
+      jogTimer = null
+    }
+  })
+
+  $effect(() => () => stopJog())
 </script>
 
 <section class="panel">
@@ -46,10 +83,12 @@
   <div class="group">
     <span class="sub">Jog</span>
     <label>Vel <input type="number" step="1" bind:value={jogVel} class="num-in" /></label>
-    <button class="btn-sm" onpointerdown={() => ws.sendAxisCmd(selAxis, 16, jogVel)}
-                           onpointerup={() => ws.sendAxisCmd(selAxis, 0)}>Jog +</button>
-    <button class="btn-sm" onpointerdown={() => ws.sendAxisCmd(selAxis, 32, jogVel)}
-                           onpointerup={() => ws.sendAxisCmd(selAxis, 0)}>Jog −</button>
+    <button class="btn-sm" onpointerdown={(e) => startJog(e, 16)}
+                           onpointerup={stopJog} onpointercancel={stopJog}
+                           onlostpointercapture={stopJog}>Jog +</button>
+    <button class="btn-sm" onpointerdown={(e) => startJog(e, 32)}
+                           onpointerup={stopJog} onpointercancel={stopJog}
+                           onlostpointercapture={stopJog}>Jog −</button>
   </div>
 
   <div class="group">
