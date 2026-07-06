@@ -76,6 +76,12 @@ func main() {
 	if certFile == "" && keyFile == "" && fileExists("cert.pem") && fileExists("key.pem") {
 		certFile, keyFile = "cert.pem", "key.pem"
 	}
+	// Half a TLS config is a misconfiguration, not a fallback: silently serving
+	// plain HTTP would send passwords in clear while logging "https" and marking
+	// the session cookie Secure (which the browser then never returns).
+	if (certFile == "") != (keyFile == "") {
+		log.Fatalf("TLS misconfigured: got cert=%q key=%q — provide both -tls-cert and -tls-key (or neither)", certFile, keyFile)
+	}
 
 	dataMap, err := shm.OpenRead(shm.NamePlcData, shm.SizePlcData)
 	if err != nil {
