@@ -32,7 +32,11 @@
     <span class="tagline">{t('demo.tagline')}</span>
   </div>
   <div class="header-right">
-    <span class="conn" class:online={ws.connected}>{ws.connected ? 'Connected' : 'Disconnected'}</span>
+    <!-- Three states: Disconnected (no WS), Stale (WS up but the PLC stopped
+         publishing — the values shown are frozen), Connected (live data). -->
+    <span class="conn" class:online={ws.connected && !ws.data?.stale} class:stale={ws.connected && ws.data?.stale}>
+      {ws.connected ? (ws.data?.stale ? 'Stale' : 'Connected') : 'Disconnected'}
+    </span>
     <div class="lang">
       {#each LOCALES as l}
         <button class="lang-btn" class:on={i18n.locale === l.id} onclick={() => i18n.setLocale(l.id)}>{l.label}</button>
@@ -143,6 +147,7 @@
   .header-right { display: flex; align-items: center; gap: 0.75rem; }
   .conn { font-size: 0.8rem; padding: 0.2rem 0.6rem; border-radius: 999px; background: #374151; color: #9ca3af; }
   .conn.online { background: #14532d; color: #4ade80; }
+  .conn.stale { background: #422006; color: #fbbf24; }
   .lang { display: inline-flex; gap: 0.25rem; }
   .lang-btn { background: #374151; color: #9ca3af; border: none; border-radius: 4px; padding: 0.2rem 0.55rem; font-size: 0.75rem; cursor: pointer; }
   .lang-btn.on { background: #1d4ed8; color: #fff; }

@@ -27,6 +27,8 @@ export interface ProductionState {
 export interface PlcData {
   type:       'data'
   ts:         number
+  stale:      boolean // backend snapshot older than its stale threshold — PLC stopped publishing
+  ageMs:      number
   system:     SystemState
   machine:    MachineState
   production: ProductionState

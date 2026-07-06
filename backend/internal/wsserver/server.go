@@ -20,9 +20,10 @@ type CommandSink interface {
 }
 
 type Server struct {
-	Snapshot *state.Snapshot
-	Commands CommandSink
-	Interval time.Duration // push interval; defaults to 100ms
+	Snapshot   *state.Snapshot
+	Commands   CommandSink
+	Interval   time.Duration // push interval; defaults to 100ms
+	StaleAfter time.Duration // snapshot age past which data is flagged stale; defaults to 500ms
 
 	// AuthorizeWrite, if set, gates command (write) messages. It is evaluated
 	// once per connection against the upgrade request — which carries the
@@ -44,6 +45,13 @@ func (s *Server) interval() time.Duration {
 		return s.Interval
 	}
 	return 100 * time.Millisecond
+}
+
+func (s *Server) staleAfter() time.Duration {
+	if s.StaleAfter > 0 {
+		return s.StaleAfter
+	}
+	return 500 * time.Millisecond
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -71,11 +79,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case <-done:
 				return
 			case <-tick.C:
-				d, _, ok := s.Snapshot.Read()
+				d, age, ok := s.Snapshot.Read()
 				if !ok {
 					continue
 				}
-				if err := conn.WriteJSON(dataFromPlc(&d)); err != nil {
+				// Keep pushing stale data (the dashboard shows the last known
+				// values) but flag it, so a dead PLC doesn't masquerade as live.
+				if err := conn.WriteJSON(dataFromPlc(&d, age, s.staleAfter())); err != nil {
 					conn.Close() // unblock the reader so it tears down
 					return
 				}
