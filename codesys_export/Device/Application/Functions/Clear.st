@@ -1,9 +1,0 @@
-FUNCTION Clear : BOOL
-VAR_INPUT
-	In : ANY;
-END_VAR
-VAR
-END_VAR
-
-// === IMPLEMENTATION ===
-SysMemSet(ADR(In),0,SIZEOF(In));
