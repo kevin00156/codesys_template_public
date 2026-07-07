@@ -4,7 +4,7 @@ import "sync/atomic"
 
 // WritePlcCommand publishes src to the segment under the seqlock protocol.
 // Caller must initialise src.Header.Magic/Version before the first call
-// (newCmdSink does this). Adding fields to PlcCommand requires no changes here.
+// (cmdsink.New does this). Adding fields to PlcCommand requires no changes here.
 //
 // The writer — not the caller — owns Header.Seq. The bulk copy below would
 // otherwise overwrite the segment's seq with src.Header.Seq (an even value),
@@ -12,10 +12,19 @@ import "sync/atomic"
 // written, so a reader could latch a torn snapshot. We force the copied seq
 // to the in-progress (odd) value to keep the seqlock invariant: seq stays
 // odd for the entire time the payload is in flux.
+//
+// Memory-ordering caveat: the payload copy is plain stores between the two
+// atomic seq stores. Sound on x86/amd64 (TSO: stores are not reordered with
+// stores), which is the only deploy target — see the matching note on
+// ReadPlcData before porting to ARM.
 func WritePlcCommand(m *Mapping, src *PlcCommand) {
 	dst := (*PlcCommand)(m.Ptr())
 	s := atomic.LoadUint32(&dst.Header.Seq)
-	odd := s + 1
+	// Crash recovery: if the previous writer process died mid-write, the
+	// segment's seq is still odd. A plain s+1 would then be even — the
+	// "write in progress" marker would look stable and a reader could latch
+	// a torn snapshot. Skip ahead to the next odd value instead.
+	odd := s + 1 + (s & 1)
 	atomic.StoreUint32(&dst.Header.Seq, odd) // odd: write in progress
 
 	tmp := *src

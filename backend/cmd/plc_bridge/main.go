@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"codesys_dev/backend/internal/auth"
+	"codesys_dev/backend/internal/cmdsink"
 	"codesys_dev/backend/internal/modbus"
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
@@ -43,12 +44,14 @@ const defaultVendorPassword = "111111"
 
 func main() {
 	var (
-		modbusAddr   = flag.String("modbus", ":5020", "Modbus TCP listen address")
+		modbusAddr   = flag.String("modbus", "127.0.0.1:5020", "Modbus TCP listen address; the Modbus write map has no authentication, so bind a non-loopback address (e.g. :5020) only on a firewalled/dedicated machine network")
 		httpAddr     = flag.String("http", ":8443", "HTTP/WebSocket listen address")
 		tlsCert      = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS; auto-detected from ./cert.pem if empty)")
 		tlsKey       = flag.String("tls-key", "", "TLS private key file (auto-detected from ./key.pem if empty)")
 		pollInterval = flag.Duration("poll", 10*time.Millisecond, "shm poll interval")
 		pushInterval = flag.Duration("push", 100*time.Millisecond, "WebSocket push interval")
+		jogTimeout   = flag.Duration("jog-timeout", 500*time.Millisecond, "dead-man timeout: jog bits not refreshed within this window are cleared")
+		staleAfter   = flag.Duration("stale-after", 500*time.Millisecond, "snapshot age past which data is flagged stale (WS) / reads fail (Modbus)")
 		genHash      = flag.Bool("gen-hash", false, "read a password from stdin, print its bcrypt hash for the PLC_BRIDGE_*_HASH env vars, then exit")
 	)
 	flag.Parse()
@@ -74,6 +77,12 @@ func main() {
 	if certFile == "" && keyFile == "" && fileExists("cert.pem") && fileExists("key.pem") {
 		certFile, keyFile = "cert.pem", "key.pem"
 	}
+	// Half a TLS config is a misconfiguration, not a fallback: silently serving
+	// plain HTTP would send passwords in clear while logging "https" and marking
+	// the session cookie Secure (which the browser then never returns).
+	if (certFile == "") != (keyFile == "") {
+		log.Fatalf("TLS misconfigured: got cert=%q key=%q — provide both -tls-cert and -tls-key (or neither)", certFile, keyFile)
+	}
 
 	dataMap, err := shm.OpenRead(shm.NamePlcData, shm.SizePlcData)
 	if err != nil {
@@ -88,10 +97,15 @@ func main() {
 	defer cmdMap.Close()
 
 	snap := &state.Snapshot{}
-	sink := newCmdSink(cmdMap)
+	sink := cmdsink.New(func(c *shm.PlcCommand) { shm.WritePlcCommand(cmdMap, c) })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Dead-man for the level-held jog bits: clients (HMI, Modbus master) must
+	// re-send jog commands periodically; bits that stop being refreshed are
+	// cleared so a vanished client can't leave an axis moving.
+	sink.StartJogWatchdog(ctx, *jogTimeout)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -101,7 +115,7 @@ func main() {
 	}()
 
 	// Modbus TCP server.
-	srv := &modbus.Server{Snapshot: snap, Commands: sink}
+	srv := &modbus.Server{Snapshot: snap, Commands: sink, StaleAfter: *staleAfter}
 	go func() {
 		if err := srv.ListenAndServe(*modbusAddr); err != nil {
 			log.Printf("modbus: %v", err)
@@ -111,9 +125,10 @@ func main() {
 
 	// HTTP/HTTPS server: WebSocket API + embedded frontend.
 	wsSrv := &wsserver.Server{
-		Snapshot: snap,
-		Commands: sink,
-		Interval: *pushInterval,
+		Snapshot:   snap,
+		Commands:   sink,
+		Interval:   *pushInterval,
+		StaleAfter: *staleAfter,
 	}
 	go func() {
 		if err := serveHTTP(*httpAddr, certFile, keyFile, wsSrv); err != nil {
@@ -238,34 +253,4 @@ func pollShm(ctx context.Context, m *shm.Mapping, snap *state.Snapshot, interval
 			snap.Update(&d)
 		}
 	}
-}
-
-// cmdSink serialises Modbus writes and pushes the latest command to
-// /dev/shm/plc_cmd. Atomic-ish semantics: a closure that returns
-// non-nil error rolls back any field mutations it made, so a rejected
-// partial write never reaches the PLC.
-type cmdSink struct {
-	mu      sync.Mutex
-	mapping *shm.Mapping
-	pending shm.PlcCommand
-}
-
-func newCmdSink(m *shm.Mapping) *cmdSink {
-	c := &cmdSink{mapping: m}
-	c.pending.Header.Magic   = shm.PlcCommandMagic
-	c.pending.Header.Version = shm.PlcCommandVersion
-	return c
-}
-
-func (c *cmdSink) Apply(fn func(*shm.PlcCommand) error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	saved := c.pending
-	if err := fn(&c.pending); err != nil {
-		c.pending = saved
-		return err
-	}
-	c.pending.Header.Cycle++
-	shm.WritePlcCommand(c.mapping, &c.pending)
-	return nil
 }

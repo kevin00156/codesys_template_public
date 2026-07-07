@@ -131,3 +131,33 @@ func TestWritePlcCommand_RoundTrip(t *testing.T) {
 		t.Errorf("2nd payload: got %d want 8", got2.Header.Cycle)
 	}
 }
+
+// TestWritePlcCommand_RecoversFromOddSeq: if the previous writer process died
+// mid-write, the segment's seq is left odd. The next write must not flip the
+// "in progress" marker to an even value (a reader could latch a torn
+// snapshot); it must skip ahead to the next odd value and finish even.
+func TestWritePlcCommand_RecoversFromOddSeq(t *testing.T) {
+	m, seg := cmdMapping()
+	seg.Header.Seq = 7 // crashed mid-write
+
+	var src PlcCommand
+	src.Header.Magic = PlcCommandMagic
+	src.Header.Version = PlcCommandVersion
+	src.Header.Cycle = 11
+
+	WritePlcCommand(m, &src)
+
+	got, ok := readCmd(m)
+	if !ok {
+		t.Fatal("readCmd: seqlock never stabilised after odd-seq recovery")
+	}
+	if got.Header.Seq&1 != 0 {
+		t.Errorf("seq still odd after write: %d", got.Header.Seq)
+	}
+	if got.Header.Seq <= 7 {
+		t.Errorf("seq did not advance past the stale value: got %d", got.Header.Seq)
+	}
+	if got.Header.Cycle != 11 {
+		t.Errorf("payload mismatch: %+v", got.Header)
+	}
+}

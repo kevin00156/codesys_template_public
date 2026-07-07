@@ -1,14 +1,20 @@
 package wsserver
 
-import "codesys_dev/backend/internal/shm"
+import (
+	"time"
+
+	"codesys_dev/backend/internal/shm"
+)
 
 // DataMsg is pushed server → client every push interval.
 type DataMsg struct {
-	Type       string          `json:"type"` // "data"
-	TS         int64           `json:"ts"`   // unix ms
-	System     systemJSON      `json:"system"`
-	Machine    machineJSON     `json:"machine"`
-	Production productionJSON  `json:"production"`
+	Type       string         `json:"type"`  // "data"
+	TS         int64          `json:"ts"`    // unix ms
+	Stale      bool           `json:"stale"` // snapshot older than the stale threshold — PLC stopped publishing
+	AgeMs      int64          `json:"ageMs"` // snapshot age in ms
+	System     systemJSON     `json:"system"`
+	Machine    machineJSON    `json:"machine"`
+	Production productionJSON `json:"production"`
 }
 
 type systemJSON struct {
@@ -53,17 +59,17 @@ type CmdMsg struct {
 	ControlFlags uint32 `json:"controlFlags"`
 
 	// "axis": per-axis command
-	AxisIndex    int     `json:"axisIndex"`
-	AxisFlags    uint32  `json:"axisFlags"`
-	JogVel       float64 `json:"jogVel"`
-	MoveAbsPos   float64 `json:"moveAbsPos"`
-	MoveAbsVel   float64 `json:"moveAbsVel"`
+	AxisIndex  int     `json:"axisIndex"`
+	AxisFlags  uint32  `json:"axisFlags"`
+	JogVel     float64 `json:"jogVel"`
+	MoveAbsPos float64 `json:"moveAbsPos"`
+	MoveAbsVel float64 `json:"moveAbsVel"`
 
 	// "production"
 	NProductionState int32 `json:"nProductionState"`
 }
 
-func dataFromPlc(d *shm.PlcData) DataMsg {
+func dataFromPlc(d *shm.PlcData, age, staleAfter time.Duration) DataMsg {
 	var axes [4]axisStateJSON
 	for i := range axes {
 		a := &d.Machine.Axes[i]
@@ -78,8 +84,10 @@ func dataFromPlc(d *shm.PlcData) DataMsg {
 		}
 	}
 	return DataMsg{
-		Type: "data",
-		TS:   timeNowMS(),
+		Type:  "data",
+		TS:    timeNowMS(),
+		Stale: age > staleAfter,
+		AgeMs: age.Milliseconds(),
 		System: systemJSON{
 			Temperature: d.System.Temperature,
 			StatusFlags: d.System.StatusFlags,

@@ -37,10 +37,19 @@ jobs:
       - name: Frontend build
         working-directory: frontend
         run: npm run build
+      - name: Frontend type check (svelte-check)
+        working-directory: frontend
+        run: npm run check
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l backend)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" && echo "$unformatted" && exit 1
+          fi
       - name: Vet
         run: go vet ./backend/...
       - name: Test

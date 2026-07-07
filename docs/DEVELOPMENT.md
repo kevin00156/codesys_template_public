@@ -17,7 +17,7 @@
         │                          │                                 │
         │ writes PlcData (seqlock) │  /ws  WebSocket push (50–100ms)  │
         ▼                          │ ◄───────────────────────────────┤ commands (CmdMsg)
-  /dev/shm/plc_data ──────────────►│  Modbus TCP :5020 → SCADA        │
+  /dev/shm/plc_data ──────────────►│  Modbus TCP 127.0.0.1:5020→SCADA │
   /dev/shm/plc_cmd  ◄──────────────┤  HTTP/HTTPS :8443 → embedded UI  │
                                    │  role-password auth + TLS        │
 ```

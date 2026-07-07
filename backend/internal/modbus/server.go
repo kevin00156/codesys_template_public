@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"codesys_dev/backend/internal/shm"
 	"codesys_dev/backend/internal/state"
@@ -39,6 +40,17 @@ type CommandSink interface {
 type Server struct {
 	Snapshot *state.Snapshot
 	Commands CommandSink
+	// StaleAfter: snapshot age past which reads fail with exception 04
+	// (server failure) instead of serving frozen values as live data.
+	// Defaults to 500ms.
+	StaleAfter time.Duration
+}
+
+func (s *Server) staleAfter() time.Duration {
+	if s.StaleAfter > 0 {
+		return s.StaleAfter
+	}
+	return 500 * time.Millisecond
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -121,8 +133,10 @@ func (s *Server) handleRead(pdu []byte) []byte {
 		return exception(pdu[0], excIllegalDataAddress)
 	}
 
-	data, _, ok := s.Snapshot.Read()
-	if !ok {
+	// Stale data is as dangerous as no data to a Modbus master polling for
+	// live state — fail the read instead of serving frozen values.
+	data, age, ok := s.Snapshot.Read()
+	if !ok || age > s.staleAfter() {
 		return exception(pdu[0], excServerFailure)
 	}
 	regs := make([]uint16, HoldingMapSize)
