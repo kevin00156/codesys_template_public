@@ -30,6 +30,7 @@ i18n、CI、部署）齊備，但**不含任何機種業務邏輯**。要做一�
 | [backend/](backend/) | Go 服務：讀寫 `/dev/shm/plc_data` 與 `/dev/shm/plc_cmd`、提供 HTTPS WebSocket 給 HMI、Modbus TCP server 給 SCADA、角色密碼 auth。 | Makefile `make deploy`（scp + ssh）到 `/opt/plc_bridge/`，systemd unit [scripts/plc_bridge.service.unit](scripts/plc_bridge.service.unit)。本機 WSL 走 `make wsl-deploy`。 |
 | [frontend/](frontend/) | Svelte 5 HMI。`npm run build` 產生 `frontend/dist/`，由 [frontend/embed.go](frontend/embed.go) 用 `//go:embed` 吞進 Go binary。 | 不獨立部署，跟著 backend binary 走。 |
 | [codesys_export/](codesys_export/) | CODESYS 專案的文字投影。每個 IEC object（DUT / GVL / POU）一個 `.st` 檔，可進 Git、用 VS Code 編輯。 | 用 [cds-text-sync](https://github.com/kevin00156/cds-text-sync) 在 CODESYS `.project` 與這些 `.st` 之間雙向同步（見下）。 |
+| [csharp/](csharp/) | Go 服務的 **C#/.NET 8 對等實作**：同一份 shm 合約、同一組 wire format，e2e harness 與前端不用改就能對接。見下方「一份合約、多個實作」。 | `dotnet build csharp/PlcBridge`；部署方式與 Go 版相同（單一 service binary）。 |
 
 ## CODESYS 文字同步（cds-text-sync）
 
@@ -63,6 +64,21 @@ PLC 與 Go 透過兩塊共享記憶體通訊，byte layout 必須兩邊一致：
 | [backend/internal/shm/layout.go](backend/internal/shm/layout.go) | [codesys_export/Device/Application/DUT/ShmBridge/](codesys_export/Device/Application/DUT/ShmBridge/) |
 
 兩邊各自定義 `Magic` 與 `Version`。**改動 layout 必須兩邊同步 bump version**，否則 Go reader 會直接拒絕掛載 segment（不會悄悄讀垃圾資料）。詳細流程見 [backend/README.md](backend/README.md)。
+
+## 一份合約、多個實作
+
+shm 佈局 + wire format（WS JSON、Modbus 位址表、auth endpoints）是**合約**；
+橋接器只是合約的實作，語言可以替換：
+
+| 實作 | 路徑 | 狀態 |
+|---|---|---|
+| Go | [backend/](backend/) | 參考實作，生產部署 |
+| C# / .NET 8 | [csharp/](csharp/) | 完整對等實作：同一個 e2e harness（[backend/e2e_smoke](backend/e2e_smoke/main.go)）一行不改 ALL PASS，golden 檔逐 byte 對齊 |
+
+跨語言對齊靠兩道閘：**golden 檔測試**（`backend/internal/shm/testdata/*.bin`，
+各實作把同一組結構體編碼成 bytes 逐一比對）與 **e2e smoke harness**（模擬 PLC，
+驗證登入 / WS 活資料 / jog watchdog / stale 偵測全鏈路）。前端與 PLC 完全不知道
+（也不需要知道）後端是哪個語言。
 
 ## 構建與部署
 

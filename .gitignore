@@ -59,3 +59,7 @@ frontend/playwright-report/
 # this list with their own state files.
 /*.db
 /recipes/
+
+# C# build output
+csharp/**/bin/
+csharp/**/obj/
