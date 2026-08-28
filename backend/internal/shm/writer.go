@@ -15,7 +15,11 @@ import "sync/atomic"
 func WritePlcCommand(m *Mapping, src *PlcCommand) {
 	dst := (*PlcCommand)(m.Ptr())
 	s := atomic.LoadUint32(&dst.Header.Seq)
-	odd := s + 1
+	// Crash recovery: if the previous writer process died mid-write, the
+	// segment's seq is still odd. A plain s+1 would then be even — the
+	// "write in progress" marker would look stable and a reader could latch
+	// a torn snapshot. Skip ahead to the next odd value instead.
+	odd := s + 1 + (s & 1)
 	atomic.StoreUint32(&dst.Header.Seq, odd) // odd: write in progress
 
 	tmp := *src
