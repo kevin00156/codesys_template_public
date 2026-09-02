@@ -22,6 +22,9 @@ const (
 )
 
 // Header is the first 24 bytes of every segment.
+//
+// Flags is project-defined per segment. plc_data leaves it zero. plc_cmd
+// carries the per-axis "touched" mask in it — see CmdFlagsAxisMaskPresent.
 type Header struct {
 	Magic   uint32
 	Version uint16
@@ -82,6 +85,29 @@ const (
 	AxisCtrlJogPos uint32 = 1 << 4
 	AxisCtrlJogNeg uint32 = 1 << 5
 )
+
+// PlcCommand.Header.Flags: which axes a publish is about.
+//
+// A reader that latches the whole struct when Header.Cycle changes (the Rust
+// motion daemon) would otherwise see every publish as a fresh request for
+// every axis, re-arming any one-shot bit still parked in the level-held word:
+// axis 0 finishes a MoveAbs with its bit still set, then an unrelated publish —
+// a jog refresh on axis 1, a machine reset, the jog watchdog — re-dispatches
+// axis 0's move or re-runs its homing. So each publish names the axes it
+// touched: bit i (0..3) is set when axis i's command changed or its source
+// explicitly addressed it; bit 15 is the marker that says the mask is
+// meaningful at all. Readers that do not know the marker (the CODESYS PLC,
+// older daemons) ignore Flags and keep treating every cycle change as fresh
+// for all axes — the old behaviour, never anything worse.
+//
+// internal/cmdsink sets these on every publish; nothing else writes Flags.
+const (
+	CmdFlagsAxisMaskPresent uint16 = 1 << 15
+)
+
+// CmdFlagsAxisTouched returns the Header.Flags bit that marks axis i as
+// addressed by a plc_cmd publish.
+func CmdFlagsAxisTouched(i int) uint16 { return 1 << uint(i) }
 
 // MachineCmd carries HMI commands for the whole machine.
 // 136 bytes.
