@@ -175,6 +175,18 @@ pub struct ExchangeStatus {
     /// Inputs come from a transaction completed in *this* call. Soft-poll
     /// backends return `false` between polls (cached data).
     pub inputs_fresh: bool,
+    /// The bus-level integrity check of this transaction passed (EtherCAT:
+    /// the LRW working counter equals the value learned when the group
+    /// reached OP; Modbus/sim: always `true`). `false` means the inputs may
+    /// be stale even though `all_axes_responding` (AL state) still looks
+    /// healthy — the daemon counts it and marks the trace sample.
+    pub working_counter_ok: bool,
+    /// Backends whose cycle is disciplined by an external clock (EtherCAT
+    /// distributed clocks: SYNC0 on the reference subdevice) return how
+    /// long the caller should wait *from the instant it called `exchange`*
+    /// before the next exchange, so the master's cycle stays phase-locked
+    /// to the bus clock. `None` = free-running; pace on the host timer.
+    pub next_cycle_wait: Option<Duration>,
 }
 
 // ─── Bus state and events ────────────────────────────────────────────────────

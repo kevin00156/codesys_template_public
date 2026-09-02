@@ -95,6 +95,38 @@ pub fn publish<T: Segment>(m: &Mapping, src: &T) {
     seq.store(odd.wrapping_add(1), Ordering::Release); // end-write: even == stable
 }
 
+/// Bring a possibly-live segment back to "no writer yet" — all-zero payload,
+/// magic 0 — under the seqlock protocol, so a reader racing with the reset
+/// either keeps its previous good snapshot or gets a clean
+/// `MagicMismatch`, never a torn mix of old data and zeros.
+///
+/// Used by the daemon at start-up when it reuses an existing segment
+/// ([`Mapping::open_or_create`]) instead of recreating it. `Header.Seq`
+/// continues from the old value (next even after the in-progress odd), so a
+/// reader's before/after seq check always trips across the reset, and the
+/// next `publish` picks up from there.
+pub fn reset<T: Segment>(m: &Mapping) {
+    assert!(m.len() >= size_of::<T>(), "segment smaller than {}", T::NAME);
+    let seq = seq_atomic(m);
+
+    let s = seq.load(Ordering::Relaxed);
+    let odd = s | 1; // even -> s+1, odd (stale, writer died mid-write) -> unchanged
+    seq.store(odd, Ordering::Relaxed);
+    fence(Ordering::Release);
+
+    let words = size_of::<T>() / 8;
+    let dst = m.ptr() as *mut u64;
+    for i in 0..words {
+        if i == SEQ_WORD {
+            continue;
+        }
+        // Safety: in bounds (asserted above), 8-aligned, atomic.
+        unsafe { AtomicU64::from_ptr(dst.add(i)).store(0, Ordering::Relaxed) };
+    }
+
+    seq.store(odd.wrapping_add(1), Ordering::Release);
+}
+
 /// Copy the segment into `dst` under the seqlock protocol — the daemon-side
 /// counterpart of Go's `ReadPlcData` (same protocol, opposite segment).
 ///

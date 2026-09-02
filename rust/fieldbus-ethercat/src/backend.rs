@@ -628,6 +628,10 @@ impl Fieldbus for EthercatBackend {
         Ok(ExchangeStatus {
             all_axes_responding: responding,
             inputs_fresh: true,
+            // TODO(review fix, backend task): compare the LRW working counter
+            // against the value learned at OP and surface DC `next_cycle_wait`.
+            working_counter_ok: true,
+            next_cycle_wait: None,
         })
     }
 

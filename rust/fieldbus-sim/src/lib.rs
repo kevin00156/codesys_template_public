@@ -261,6 +261,8 @@ impl Fieldbus for SimBackend {
         Ok(ExchangeStatus {
             all_axes_responding: true,
             inputs_fresh: true,
+            working_counter_ok: true,
+            next_cycle_wait: None,
         })
     }
 
