@@ -97,7 +97,17 @@ func main() {
 	defer cmdMap.Close()
 
 	snap := &state.Snapshot{}
-	sink := cmdsink.New(func(c *shm.PlcCommand) { shm.WritePlcCommand(cmdMap, c) })
+
+	// Continue the command cycle counter from wherever the previous bridge
+	// left it. Readers (PLC, motion daemon) treat a Header.Cycle change as
+	// "new command" and may have latched the last value before we restarted;
+	// a sink starting over at 1 would replay numbers they have already seen,
+	// so our first all-clear publish could be ignored as "not new" and the
+	// machine would keep executing the last word — possibly a jog. Go is the
+	// sole writer of plc_cmd, so a plain load at start-up is race-free.
+	lastCycle := (*shm.PlcCommand)(cmdMap.Ptr()).Header.Cycle
+	sink := cmdsink.New(func(c *shm.PlcCommand) { shm.WritePlcCommand(cmdMap, c) }).SeedCycle(lastCycle)
+	log.Printf("%s: continuing cycle counter from %d", shm.NamePlcCommand, lastCycle)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

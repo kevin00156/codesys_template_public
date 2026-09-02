@@ -58,7 +58,7 @@ type TraceAxisSample struct {
 
 // TraceSample is one control cycle. 256 bytes.
 // BusState: 0=Init 1=PreOp 2=SafeOp 3=Op.
-// StatusBits: b0=exchange_error b1=cmd_fresh b2=cmd_valid.
+// StatusBits: b0=exchange_error b1=cmd_fresh b2=cmd_valid b3=cycle_overrun b4=wkc_error.
 type TraceSample struct {
 	Cycle      uint64 // plc_data header cycle counter at publish time
 	TMonoNs    uint64 // monotonic ns since segment creation

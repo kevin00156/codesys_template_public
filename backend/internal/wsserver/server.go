@@ -14,9 +14,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// CommandSink is the same interface used by the Modbus server.
+// CommandSink is the write side of internal/cmdsink. The Modbus server only
+// needs Apply; the WebSocket path also uses ApplyTouching so an axis message
+// can name its axis explicitly (see applyCmd).
 type CommandSink interface {
 	Apply(func(*shm.PlcCommand) error) error
+	ApplyTouching(mask uint16, fn func(*shm.PlcCommand) error) error
 }
 
 type Server struct {
@@ -151,23 +154,38 @@ func (s *Server) applyCmd(cmd *CmdMsg) error {
 	if s.Commands == nil {
 		return fmt.Errorf("command sink unavailable (PLC shm not mounted)")
 	}
-	return s.Commands.Apply(func(c *shm.PlcCommand) error {
-		switch cmd.Type {
-		case "machine":
+	switch cmd.Type {
+	case "machine":
+		// Plain Apply: no axis is named, so a machine reset does not re-arm a
+		// one-shot bit still parked in some axis's word. (The Modbus write
+		// path is likewise plain Apply — it has no per-axis message shape,
+		// so the sink's struct diff is the best it can do.)
+		return s.Commands.Apply(func(c *shm.PlcCommand) error {
 			c.Machine.ControlFlags = cmd.ControlFlags
-		case "axis":
-			if cmd.AxisIndex >= 0 && cmd.AxisIndex < 4 {
-				a := &c.Machine.Axes[cmd.AxisIndex]
-				a.ControlFlags = cmd.AxisFlags
-				a.JogVel = cmd.JogVel
-				a.MoveAbsPos = cmd.MoveAbsPos
-				a.MoveAbsVel = cmd.MoveAbsVel
-			}
-		case "production":
-			c.Production.NProductionState = cmd.NProductionState
-		default:
-			return fmt.Errorf("unknown command type %q", cmd.Type)
+			return nil
+		})
+	case "axis":
+		if cmd.AxisIndex < 0 || cmd.AxisIndex >= 4 {
+			return fmt.Errorf("axis index %d out of range", cmd.AxisIndex)
 		}
-		return nil
-	})
+		// Name the axis explicitly instead of trusting the sink's diff: an
+		// operator re-sending an identical word (same MoveAbs target twice) is
+		// a fresh request for this axis, and a diff alone would publish it
+		// with no axis touched, so a cycle-latching reader would never re-arm.
+		return s.Commands.ApplyTouching(shm.CmdFlagsAxisTouched(cmd.AxisIndex), func(c *shm.PlcCommand) error {
+			a := &c.Machine.Axes[cmd.AxisIndex]
+			a.ControlFlags = cmd.AxisFlags
+			a.JogVel = cmd.JogVel
+			a.MoveAbsPos = cmd.MoveAbsPos
+			a.MoveAbsVel = cmd.MoveAbsVel
+			return nil
+		})
+	case "production":
+		return s.Commands.Apply(func(c *shm.PlcCommand) error {
+			c.Production.NProductionState = cmd.NProductionState
+			return nil
+		})
+	default:
+		return fmt.Errorf("unknown command type %q", cmd.Type)
+	}
 }
