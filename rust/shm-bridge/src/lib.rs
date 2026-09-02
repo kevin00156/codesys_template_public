@@ -20,7 +20,7 @@ pub use channel::{CmdReader, DataPublisher};
 pub use layout::*;
 pub use mapping::Mapping;
 pub use seqlock::{publish, reset, snapshot, ReadError, SEQLOCK_MAX_RETRIES};
-pub use trace::{TraceAxisSample, TraceHeader, TraceReader, TraceSample, TraceWriter};
+pub use trace::{status_bits, TraceAxisSample, TraceHeader, TraceReader, TraceSample, TraceWriter};
 
 #[cfg(test)]
 mod tests {
@@ -50,6 +50,14 @@ mod tests {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), m.ptr(), bytes.len().min(m.len()));
             AtomicU32::from_ptr(m.ptr().add(8) as *mut u32).store(seq, Ordering::Release);
         }
+    }
+
+    /// Atomic view of `Header.seq` in the raw segment (test-only peek/poke,
+    /// the same word `seqlock::seq_atomic` owns).
+    fn raw_seq(m: &Mapping) -> &AtomicU32 {
+        // Safety: offset 8 is in bounds of every segment and 4-aligned; all
+        // access to this word is atomic.
+        unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }
     }
 
     #[test]
@@ -118,6 +126,39 @@ mod tests {
         assert_eq!(got2.header.cycle, 8);
     }
 
+    /// A writer killed mid-write leaves the segment on an odd seq. The next
+    /// publish must skip to the *next odd* value (`s + 2`), not `s + 1`
+    /// (even): otherwise the in-progress marker looks stable and the end
+    /// store parks the segment odd forever — every later snapshot `Busy`.
+    /// Mirrors the writer.go crash-recovery fix.
+    #[test]
+    fn publish_recovers_from_stale_odd_seq() {
+        for (stale, expect) in [(1u32, 4u32), (9, 12)] {
+            let m = cmd_mapping();
+            raw_seq(&m).store(stale, Ordering::Release);
+            let mut got = PlcCommand::default();
+            assert_eq!(snapshot(&m, &mut got), Err(ReadError::Busy), "stale seq {stale}");
+
+            let mut src = PlcCommand::default();
+            src.header.magic = PLC_COMMAND_MAGIC;
+            src.header.version = PLC_COMMAND_VERSION;
+            src.header.cycle = 7;
+            publish(&m, &src);
+
+            snapshot(&m, &mut got).unwrap_or_else(|e| panic!("stale seq {stale}: {e}"));
+            assert_eq!(got.header.seq % 2, 0, "stale seq {stale}: must end even");
+            assert_eq!(got.header.seq, expect, "stale seq {stale}");
+            assert_eq!(got.header.cycle, 7);
+
+            // Recovered: the next publish advances by exactly 2 again.
+            src.header.cycle = 8;
+            publish(&m, &src);
+            snapshot(&m, &mut got).unwrap_or_else(|e| panic!("stale seq {stale}, 2nd: {e}"));
+            assert_eq!(got.header.seq, expect + 2, "stale seq {stale}");
+            assert_eq!(got.header.cycle, 8);
+        }
+    }
+
     /// Writer hammers the segment while a reader snapshots; two fields that
     /// must agree within one snapshot (flags == low 16 bits of cycle) expose
     /// torn reads. Mirrors seqlock_concurrent_test.go.
@@ -139,7 +180,7 @@ mod tests {
                 for i in 1u64..=500_000 {
                     src.header.flags = i as u16;
                     src.header.cycle = i;
-                    publish(&*m, &src);
+                    publish(&m, &src);
                 }
                 stop.store(true, Ordering::Release);
             })
@@ -149,7 +190,7 @@ mod tests {
         let mut reads = 0u64;
         while !stop.load(Ordering::Acquire) {
             let mut got = PlcCommand::default();
-            if snapshot(&*m, &mut got).is_ok() {
+            if snapshot(&m, &mut got).is_ok() {
                 reads += 1;
                 if got.header.flags != got.header.cycle as u16 {
                     torn += 1;
@@ -173,11 +214,11 @@ mod tests {
         src.header.cycle = 7;
         src.machine.axes[0].control_flags = 0x30; // stale jog word
         publish(&m, &src);
-        let before = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        let before = raw_seq(&m).load(Ordering::Acquire);
         assert_eq!(before, 2);
 
         reset::<PlcCommand>(&m);
-        let after = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        let after = raw_seq(&m).load(Ordering::Acquire);
         assert_eq!(after % 2, 0, "reset must end on an even seq");
         assert_ne!(after, before, "seq must move so a racing reader retries");
 
@@ -186,9 +227,9 @@ mod tests {
         assert_eq!(got.machine.axes[0].control_flags, 0, "payload zeroed");
 
         // A stale odd seq (writer died mid-write) is repaired too.
-        unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.store(9, Ordering::Release);
+        raw_seq(&m).store(9, Ordering::Release);
         reset::<PlcCommand>(&m);
-        let repaired = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        let repaired = raw_seq(&m).load(Ordering::Acquire);
         assert_eq!(repaired, 10);
 
         // Publishing afterwards continues from the reset seq.

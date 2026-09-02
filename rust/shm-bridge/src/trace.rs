@@ -81,10 +81,36 @@ pub struct TraceAxisSample {
     pub io_bits: u32,
 }
 
+/// Bit assignments for [`TraceSample::status_bits`]. The Go bridge decodes
+/// these by position (`trace.go`), so they are wire layout: never renumber,
+/// only append — and appending is data, not layout, so it needs no
+/// [`PLC_TRACE_VERSION`] bump.
+pub mod status_bits {
+    /// b0: `bus.exchange` failed this cycle — the axis/machine fields of the
+    /// sample repeat the last good state and the inputs are stale.
+    pub const EXCHANGE_ERROR: u8 = 1 << 0;
+    /// b1: a new `plc_cmd` message was latched this cycle
+    /// (`CmdReader::poll` returned `Ok(true)`).
+    pub const CMD_FRESH: u8 = 1 << 1;
+    /// b2: the command latch holds a valid command (at least one
+    /// `plc_cmd` snapshot has been accepted since the daemon started).
+    pub const CMD_VALID: u8 = 1 << 2;
+    /// b3: the daemon detected a cycle overrun and re-synchronised its
+    /// timer this cycle (the measured `period_ns` of this or the next sample
+    /// is not the nominal one).
+    pub const OVERRUN: u8 = 1 << 3;
+    /// b4: the bus working counter check failed this cycle — the frame went
+    /// round but not every slave processed it, so inputs may be stale even
+    /// though `bus.exchange` returned no error.
+    pub const WKC_ERROR: u8 = 1 << 4;
+}
+
 /// One control cycle. 256 bytes exactly (32 u64 words).
 ///
 /// Encodings: `bus_state`: 0=Init 1=PreOp 2=SafeOp 3=Op.
-/// `status_bits`: b0=exchange_error b1=cmd_fresh b2=cmd_valid.
+/// `status_bits`: b0=exchange_error b1=cmd_fresh b2=cmd_valid b3=overrun
+/// (cycle overrun detected, timer re-synchronised) b4=wkc_error (bus working
+/// counter check failed) — named in [`status_bits`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TraceSample {
@@ -97,6 +123,7 @@ pub struct TraceSample {
     /// `bus.exchange` duration, ns.
     pub exchange_ns: u32,
     pub bus_state: u8,
+    /// OR of [`status_bits`] flags.
     pub status_bits: u8,
     pub _pad: u16,
     pub run_state: u32,
@@ -125,6 +152,38 @@ fn write_idx_atomic(m: &Mapping) -> &AtomicU64 {
     // Safety: offset 32 is in bounds and 8-aligned (mapping is 8-aligned);
     // every access to this word goes through this atomic view.
     unsafe { AtomicU64::from_ptr(m.ptr().add(WRITE_IDX_OFFSET) as *mut u64) }
+}
+
+/// Copy the header out of the mapping without racing the writer.
+///
+/// Every field except `write_idx` is written once by [`TraceWriter::new`]
+/// before the magic becomes visible and never changes afterwards, so plain
+/// reads of them are race-free. `write_idx` is stored concurrently through
+/// [`write_idx_atomic`]; a plain read of that word — even as part of a
+/// whole-struct `ptr::read` — is a data race under the Rust memory model, so
+/// it is the one field fetched through the atomic view (acquire, like
+/// `read_range`, so a caller that acts on the count also sees the samples).
+fn read_header(m: &Mapping) -> TraceHeader {
+    use core::ptr::addr_of;
+    assert!(m.len() >= SIZE_TRACE_HEADER, "trace segment smaller than its header");
+    let p = m.ptr() as *const TraceHeader;
+    // Safety: every field is in bounds (asserted above) and naturally
+    // aligned (mapping is 8-aligned, layout pinned below); the plain reads
+    // touch only words no writer stores after creation, the write_idx word
+    // is read through its atomic view.
+    unsafe {
+        TraceHeader {
+            magic: addr_of!((*p).magic).read(),
+            version: addr_of!((*p).version).read(),
+            flags: addr_of!((*p).flags).read(),
+            sample_size: addr_of!((*p).sample_size).read(),
+            capacity: addr_of!((*p).capacity).read(),
+            period_ns: addr_of!((*p).period_ns).read(),
+            epoch_unix_ns: addr_of!((*p).epoch_unix_ns).read(),
+            write_idx: write_idx_atomic(m).load(Ordering::Acquire),
+            _pad: addr_of!((*p)._pad).read(),
+        }
+    }
 }
 
 /// View a sample as raw bytes (golden fixtures, encoders).
@@ -265,9 +324,9 @@ impl TraceReader {
         if map.len() < SIZE_TRACE_HEADER {
             return Err(TraceReadError::Geometry);
         }
-        // Safety: header fits; concurrent writer only mutates write_idx,
-        // which this read tolerates (validated fields are written once).
-        let hdr = unsafe { (map.ptr() as *const TraceHeader).read() };
+        // The concurrent writer only mutates write_idx, which read_header
+        // fetches atomically; the validated fields are written once.
+        let hdr = read_header(&map);
         if hdr.magic != PLC_TRACE_MAGIC {
             return Err(TraceReadError::MagicMismatch);
         }
@@ -286,9 +345,10 @@ impl TraceReader {
         })
     }
 
+    /// The header as of now; `write_idx` is an acquire load of the live
+    /// count, the rest is the creation-time geometry validated in `new()`.
     pub fn header(&self) -> TraceHeader {
-        // Safety: validated in new(); write_idx may race, any value is valid.
-        unsafe { (self.map.ptr() as *const TraceHeader).read() }
+        read_header(&self.map)
     }
 
     /// Copy samples `[since, write_idx)` (at most `max`) into `out`.
@@ -382,11 +442,14 @@ mod tests {
     }
 
     fn sample(i: u64) -> TraceSample {
-        let mut s = TraceSample::default();
-        s.cycle = i;
-        s.t_mono_ns = i * 2_000_000;
-        s.axes[0].act_pos = i as f64;
-        s
+        let mut axes = [TraceAxisSample::default(); 4];
+        axes[0].act_pos = i as f64;
+        TraceSample {
+            cycle: i,
+            t_mono_ns: i * 2_000_000,
+            axes,
+            ..Default::default()
+        }
     }
 
     /// Reader over the same memory as the writer (the real reader is the Go

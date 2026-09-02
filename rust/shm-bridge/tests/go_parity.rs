@@ -20,14 +20,16 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// Same formulas as Go's goldenData().
 fn golden_data() -> PlcData {
-    let mut d = PlcData::default();
-    d.header = Header {
-        magic: layout::PLC_DATA_MAGIC,
-        version: layout::PLC_DATA_VERSION,
-        flags: 0x5A5A,
-        seq: 6,
-        _pad: 0,
-        cycle: 0x1122_3344_5566_7788,
+    let mut d = PlcData {
+        header: Header {
+            magic: layout::PLC_DATA_MAGIC,
+            version: layout::PLC_DATA_VERSION,
+            flags: 0x5A5A,
+            seq: 6,
+            _pad: 0,
+            cycle: 0x1122_3344_5566_7788,
+        },
+        ..Default::default()
     };
     d.system.temperature = 36.75;
     d.system.status_flags = 0xC0FF_EE01;
@@ -53,14 +55,16 @@ fn golden_data() -> PlcData {
 
 /// Same formulas as Go's goldenCmd().
 fn golden_cmd() -> PlcCommand {
-    let mut c = PlcCommand::default();
-    c.header = Header {
-        magic: layout::PLC_COMMAND_MAGIC,
-        version: layout::PLC_COMMAND_VERSION,
-        flags: 0xA5A5,
-        seq: 8,
-        _pad: 0,
-        cycle: 0x8877_6655_4433_2211,
+    let mut c = PlcCommand {
+        header: Header {
+            magic: layout::PLC_COMMAND_MAGIC,
+            version: layout::PLC_COMMAND_VERSION,
+            flags: 0xA5A5,
+            seq: 8,
+            _pad: 0,
+            cycle: 0x8877_6655_4433_2211,
+        },
+        ..Default::default()
     };
     for (i, ax) in c.machine.axes.iter_mut().enumerate() {
         let i = i as f64;
