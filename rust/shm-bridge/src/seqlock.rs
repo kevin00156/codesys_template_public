@@ -74,7 +74,14 @@ pub fn publish<T: Segment>(m: &Mapping, src: &T) {
     let seq = seq_atomic(m);
 
     let s = seq.load(Ordering::Relaxed);
-    let odd = s.wrapping_add(1); // sole writer: s is even, s+1 is odd
+    // Crash recovery (mirrors writer.go): if the previous writer process died
+    // mid-write the segment's seq is still odd. A plain `s + 1` would then be
+    // EVEN — the "write in progress" marker would look stable (a reader can
+    // latch a torn snapshot) and the end store would park the segment on an
+    // odd value, so every later snapshot returns `Busy` with no error
+    // anywhere. Skipping to the next odd value makes a single publish
+    // self-correct: even -> s+1, stale odd -> s+2.
+    let odd = s.wrapping_add(1 + (s & 1));
     seq.store(odd, Ordering::Relaxed);
     fence(Ordering::Release); // begin-write: payload stores stay after the odd store
 
