@@ -37,8 +37,11 @@ pub fn trapezoid_tick(
     // Highest speed from which we can still stop at the target with `dec`.
     let v_stop = (2.0 * dec.abs() * dist.abs()).sqrt();
     let v_des = dir * v_stop.min(vmax.abs());
-    // Speeding up (toward v_des) uses acc, slowing down uses dec.
-    let rate = if (v_des - vel) * dir > 0.0 { acc } else { dec };
+    // Speeding up (|vel| growing, or starting from rest) uses acc; slowing
+    // down uses dec — including the braking half of a reversal, where
+    // v_des already points the other way.
+    let dv = v_des - vel;
+    let rate = if vel == 0.0 || dv * vel > 0.0 { acc } else { dec };
     let vel = ramp_vel(vel, v_des, rate, dt);
     let new_pos = pos + vel * dt;
 
@@ -104,5 +107,40 @@ mod tests {
             assert!(nv <= 0.0, "wrong direction");
         }
         assert_eq!(p, -7.0);
+    }
+
+    /// Retarget behind the axis while cruising: the reversal brakes with
+    /// `dec` (not `acc`), never jumps, and still lands exactly.
+    #[test]
+    fn trapezoid_reversal_brakes_with_dec_and_lands() {
+        let (acc, dec, dt) = (100.0, 400.0, 0.001);
+        let (mut p, mut v) = (0.0, 10.0); // cruising +10, now told to go to -5
+        let mut ticks_to_zero = 0;
+        loop {
+            let (np, nv, _) = trapezoid_tick(p, v, -5.0, 10.0, acc, dec, dt);
+            assert!((np - p).abs() <= 10.0 * dt + 1e-12, "position jump {p} → {np}");
+            p = np;
+            v = nv;
+            if v <= 0.0 {
+                break;
+            }
+            ticks_to_zero += 1;
+            assert!(ticks_to_zero < 1000, "never reversed");
+        }
+        // 10 → 0 at dec=400 is 25 ms; braking with acc=100 would take 100 ms.
+        assert!(
+            ticks_to_zero <= 26,
+            "reversal braked with acc, not dec: {ticks_to_zero} ticks"
+        );
+        for _ in 0..100_000 {
+            let (np, nv, done) = trapezoid_tick(p, v, -5.0, 10.0, acc, dec, dt);
+            p = np;
+            v = nv;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(p, -5.0);
+        assert_eq!(v, 0.0);
     }
 }

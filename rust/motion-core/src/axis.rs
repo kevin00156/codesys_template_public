@@ -15,6 +15,28 @@
 //! 2. Error recovery always requires the HMI `RESET` bit while in
 //!    `TRY_RESET` (the FB auto-retries some paths); explicit reset is
 //!    deterministic and safer over a 50–100 ms HMI link.
+//! 3. Drive drop-out is an error: past ENABLING, any `DriveStatus` other
+//!    than `Enabled` (not only `Fault`) raises `DRIVER_ERROR`. The FB gets
+//!    this from the SoftMotion FBs' `Error` outputs once the axis leaves
+//!    `power_on`; here the CSP integrator would otherwise keep running
+//!    against a motor that is not following, and the drive would jump to
+//!    the accumulated setpoint on re-enable. Consequently TRY_RESET → READY
+//!    also requires `Enabled` again (the adapter re-runs the enable
+//!    handshake after a fault reset), and while the drive is out `set_pos`
+//!    tracks the actual position.
+//! 4. `set_pos` tracks the actual position while the drive/backend owns
+//!    the trajectory (HOMING_WRITE_PARAM / HOMING_EXEC, `Setpoint::Home`),
+//!    so a cancel — HOME released or EMS, both → STOPPING — ramps down from
+//!    where the axis really is. MC_Stop starts from the SoftMotion axis'
+//!    live setpoint for free; our stop ramp starts from `set_pos`, which
+//!    must therefore not be the stale pre-homing value.
+//! 5. A *fresh* command word with `MOVE_ABS` still set while in MOVE_ABS
+//!    re-targets the running move: new target/velocity, profile continues
+//!    from the current `set_pos`/`set_vel` (reversing if it must);
+//!    velocity ≤ 0 raises `MOVE_ABS_FAIL` exactly like READY does. Without
+//!    this the operator's second Go click is swallowed — the bit is
+//!    level-held so the new target was never read, and deviation 1's
+//!    re-arm latch then locks it once the first move completes.
 
 use fieldbus_api::{AxisIn, AxisOut, DriveStatus, Setpoint};
 
@@ -157,13 +179,36 @@ impl AxisControl {
         }
 
         // ── 4. drive error detection (Main.st `_DetectErrors`) ──────────
-        // A drive fault anywhere past IDLE latches DRIVER_ERROR; TRY_RESET
-        // owns recovery.
-        if input.drive == DriveStatus::Fault
+        // Past ENABLING the drive must stay in Operation Enabled: a fault,
+        // but equally a quick-stop, a drop to Disabled/Enabling or going
+        // offline means the motor is no longer following the CSP stream
+        // (the FB sees this as the SoftMotion FBs' `Error` outputs). Latch
+        // DRIVER_ERROR; TRY_RESET owns recovery. Deliberately ahead of the
+        // EMS block so an EMS-held machine still records the drop-out.
+        if input.drive != DriveStatus::Enabled
             && !self.error
-            && !matches!(self.step, Step::Idle | Step::Enabling | Step::NotReady)
+            && !matches!(
+                self.step,
+                Step::Idle | Step::Enabling | Step::NotReady | Step::TryReset
+            )
         {
             self.raise(error_id::DRIVER_ERROR);
+        }
+
+        // ── setpoint re-seat where the drive does not follow `set_pos` ───
+        // While the drive/backend owns the trajectory (homing) or has
+        // dropped out of Operation Enabled (TRY_RESET, deviation 3), the
+        // CSP setpoint is not what the motor is doing. Glue it to the actual
+        // position so whatever comes next — the EMS/STOPPING ramp, or the
+        // CSP stream resuming on re-enable — starts from where the axis
+        // really is. Sits ahead of the EMS block on purpose: the EMS ramp
+        // is the thing that would otherwise command the jump.
+        // (IDLE/ENABLING/NOT_READY do the same inside their CASE branch.)
+        if matches!(self.step, Step::HomingWriteParam | Step::HomingExec)
+            || (self.step == Step::TryReset && input.drive != DriveStatus::Enabled)
+        {
+            self.set_pos = input.act_pos;
+            self.set_vel = 0.0;
         }
 
         // ── 5. EMS: decelerate, force motion steps into STOPPING, freeze
@@ -258,7 +303,19 @@ impl AxisControl {
                 if !req.has(cmd::MOVE_ABS) {
                     // caller stopped calling MoveAbsolute() → cancel
                     self.step = Step::Stopping;
+                } else if req.fresh && req.move_abs_vel <= 0.0 {
+                    // re-trigger with an invalid velocity: same rejection
+                    // as READY's dispatch
+                    self.raise(error_id::MOVE_ABS_FAIL);
                 } else {
+                    if req.fresh {
+                        // A new command word with the bit still set is a
+                        // new MoveAbsolute() call (deviation 5): adopt the
+                        // target on the fly. The profile continues from the
+                        // current set_pos/set_vel and reverses if it must.
+                        self.move_target = req.move_abs_pos;
+                        self.move_vmax = req.move_abs_vel.min(self.params.max_vel);
+                    }
                     let (p, v, done) = trapezoid_tick(
                         self.set_pos,
                         self.set_vel,
@@ -291,10 +348,10 @@ impl AxisControl {
 
             Step::HomingExec => {
                 self.busy = true;
-                self.set_vel = 0.0; // trajectory is drive/backend-owned during homing
+                // Trajectory is drive/backend-owned (Setpoint::Home);
+                // set_pos/set_vel are re-seated on the actual position
+                // above, which also absorbs the reference jump on `homed`.
                 if input.homed {
-                    // position reference jumped: re-seat the setpoint
-                    self.set_pos = input.act_pos;
                     self.home_rearm = true;
                     self.step = Step::Stopping;
                 } else if !req.has(cmd::HOME) {
@@ -322,7 +379,11 @@ impl AxisControl {
                 if req.has(cmd::RESET) {
                     self.out_fault_reset = true;
                 }
-                let healthy = input.drive != DriveStatus::Fault && input.fault_code == 0;
+                // Back in Operation Enabled, not merely fault-free: the
+                // adapter re-runs the enable handshake after a fault reset,
+                // and READY would re-raise (deviation 3) against a drive
+                // that is still Enabling.
+                let healthy = input.drive == DriveStatus::Enabled && input.fault_code == 0;
                 if req.has(cmd::RESET) && healthy && self.standstill(input) {
                     self.error = false;
                     self.error_id = error_id::NONE;
