@@ -18,22 +18,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fieldbus_api::{AxisIn, AxisOut, BusState, DriveStatus, Fieldbus};
 use shm_bridge::{
-    layout, trace, Mapping, PlcCommand, PlcData, Segment, TraceSample, TraceWriter,
+    layout, status_bits, trace, Mapping, PlcCommand, PlcData, Segment, TraceSample, TraceWriter,
 };
 
 use engine::{Engine, EngineConfig, ShutdownPhase};
-
-/// `TraceSample.status_bits`. b0..b2 are documented in `shm_bridge::trace`;
-/// b3/b4 are new here and mirrored by the Go trace decoder.
-mod status_bits {
-    pub const EXCHANGE_ERROR: u8 = 1 << 0;
-    pub const CMD_FRESH: u8 = 1 << 1;
-    pub const CMD_VALID: u8 = 1 << 2;
-    /// This wake missed at least one whole deadline (pacing resynced).
-    pub const OVERRUN: u8 = 1 << 3;
-    /// `ExchangeStatus::working_counter_ok` was false.
-    pub const WKC_ERROR: u8 = 1 << 4;
-}
 
 fn main() -> ExitCode {
     let cfg = match config::parse(std::env::args()) {
