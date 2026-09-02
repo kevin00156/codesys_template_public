@@ -3,18 +3,29 @@
 //! Lifecycle: `start()` = topology scan → PREOP configuration (CSP mode,
 //! PDO mapping, optional DC SYNC0) → OP, with the tx/rx driver on its own
 //! thread. `exchange()` = one LRW cycle: write controlword/targets into the
-//! PDI, transact, decode statuswords/actuals. All per-cycle state lives in
-//! preallocated fixed-size buffers — the hot path performs no heap
-//! allocation and holds the PDI spinlock guard only for the few-byte copies.
+//! PDI, transact, decode statuswords/actuals. `stop()` = a few cycles of
+//! controlword 0, then OP → SAFEOP → PREOP so the drives are parked rather
+//! than watchdog-faulted. All per-cycle state lives in preallocated
+//! fixed-size buffers — the hot path performs no heap allocation, formats
+//! nothing except on a health edge, and holds the PDI spinlock guard only
+//! for the few-byte copies.
+//!
+//! Bus health per cycle is two checks, not one: every subdevice reports OP
+//! (AL status) **and** the LRW working counter equals the value learned when
+//! the group first reached OP ([`WkcMonitor`]). ethercrab returns the WKC
+//! but never validates it, and a subdevice that stops processing the LRW
+//! keeps the AL bitmap at OP. With DC the cycle is paced by the
+//! `next_cycle_wait` ethercrab derives from SYNC0, not by the host clock
+//! (surfaced to the daemon through `ExchangeStatus::next_cycle_wait`).
 //!
 //! ethercrab types stay `pub(crate)` at most; the public surface is
 //! `EthercatBackend` + `EcatConfig` only.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ethercrab::{
     std::{ethercat_now, tx_rx_task},
-    subdevice_group::{CycleInfo, DcConfiguration, HasDc, NoDc, Op, PreOp},
+    subdevice_group::{DcConfiguration, HasDc, NoDc, Op, PreOp},
     DcSync, MainDevice, MainDeviceConfig, PduStorage, SubDeviceGroup, SubDeviceState, Timeouts,
 };
 use fieldbus_api::{
@@ -26,6 +37,7 @@ use fieldbus_api::{
 use crate::cia402::Cia402;
 use crate::config::EcatConfig;
 use crate::pdo;
+use crate::wkc::WkcMonitor;
 
 const MAX_FRAMES: usize = 16;
 const MAX_PDU_DATA: usize = PduStorage::element_size(1100);
@@ -60,6 +72,9 @@ struct AxisRt {
 struct Running {
     maindevice: MainDevice<'static>,
     group: OpGroup,
+    /// Reference working counter learned when the group reached OP, and
+    /// the last verdict for once-per-edge logging.
+    wkc: WkcMonitor,
 }
 
 /// Fixed-capacity event ring: the cycle path pushes without allocating;
@@ -323,7 +338,16 @@ impl Fieldbus for EthercatBackend {
             pdu_loop,
             Timeouts {
                 state_transition: Duration::from_secs(5),
-                pdu: Duration::from_millis(100),
+                // A PDU timeout is the longest one tx_rx can block, so it
+                // bounds how long a single lost frame stalls the cyclic
+                // loop. At the previous 100 ms one lost LRW at a 1 ms cycle
+                // froze ~100 cycles — also the typical subdevice SM-watchdog
+                // window, i.e. every drive faulted out over one dropped
+                // frame. A few cycles is plenty: a frame's round trip over a
+                // segment of tens of nodes is tens of µs, and PREOP SDO
+                // traffic needs only that per PDU (the slow mailbox part is
+                // covered by `mailbox_response`).
+                pdu: (self.cfg.cycle * 4).max(Duration::from_millis(2)),
                 mailbox_response: Duration::from_secs(1),
                 ..Timeouts::default()
             },
@@ -388,7 +412,7 @@ impl Fieldbus for EthercatBackend {
         // ── PDI + OP ────────────────────────────────────────────────────
         // request_into_op (not into_op): we must run the process data loop
         // while subdevices transition, to feed watchdogs and valid data.
-        let mut group = if self.cfg.dc {
+        let group = if self.cfg.dc {
             let group = group
                 .configure_dc_sync(
                     &maindevice,
@@ -431,31 +455,48 @@ impl Fieldbus for EthercatBackend {
         self.events.push(BusEvent::BusStateChanged(BusState::SafeOp));
 
         // Drive the cycle until every subdevice reports OP (bounded wait).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // The DC variant paces on `next_cycle_wait` from the pre-tx/rx
+        // timestamp, as ethercrab's `tx_rx_dc` example does, so the LRW is
+        // already phase-locked to SYNC0 while the drives transition (they
+        // check the sync window before granting OP). The working counter of
+        // the first all-OP cycle becomes the reference every later cycle is
+        // checked against.
+        let mut wkc = WkcMonitor::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let all_op = match &mut group {
+            let now = Instant::now();
+            let (all_op, counter, wait) = match &group {
                 OpGroup::NoDc(g) => {
                     let r = g.tx_rx(&maindevice).await.map_err(|e| {
                         eprintln!("ecat: tx/rx while entering OP: {e}");
                         FieldbusError::Exchange("tx/rx while entering OP")
                     })?;
-                    r.is_in_state(SubDeviceState::Op)
+                    (
+                        r.is_in_state(SubDeviceState::Op),
+                        r.working_counter,
+                        self.cfg.cycle,
+                    )
                 }
                 OpGroup::Dc(g) => {
                     let r = g.tx_rx_dc(&maindevice).await.map_err(|e| {
                         eprintln!("ecat: tx/rx while entering OP: {e}");
                         FieldbusError::Exchange("tx/rx while entering OP")
                     })?;
-                    r.is_in_state(SubDeviceState::Op)
+                    (
+                        r.is_in_state(SubDeviceState::Op),
+                        r.working_counter,
+                        r.extra.next_cycle_wait,
+                    )
                 }
             };
+            wkc.learn(all_op, counter);
             if all_op {
                 break;
             }
-            if std::time::Instant::now() > deadline {
+            if now > deadline {
                 return Err(FieldbusError::Timeout);
             }
-            smol::Timer::after(self.cfg.cycle).await;
+            smol::Timer::at(now + wait).await;
         }
 
         // Validate that the drives' PDI regions match our expected layout —
@@ -497,46 +538,83 @@ impl Fieldbus for EthercatBackend {
             self.events.push(BusEvent::AxisOnline(AxisId(i)));
         }
         self.was_responding = true;
-        self.running = Some(Running { maindevice, group });
-        eprintln!("ecat: OP reached, cyclic exchange live");
+        eprintln!(
+            "ecat: OP reached, cyclic exchange live (working counter {})",
+            wkc.expected().unwrap_or(0)
+        );
+        self.running = Some(Running {
+            maindevice,
+            group,
+            wkc,
+        });
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), FieldbusError> {
-        let Some(mut running) = self.running.take() else {
+        let Some(running) = self.running.take() else {
             return Ok(());
         };
+        let Running {
+            maindevice, group, ..
+        } = running;
         // Best effort: a few cycles of controlword 0 (disable voltage) so
-        // drives drop out of Operation Enabled before we abandon the bus.
+        // drives drop out of Operation Enabled before we leave OP. Paced
+        // like `exchange()` so DC drives see no sync error on the way out.
         for _ in 0..5 {
-            for axis in &mut self.axes {
+            let now = Instant::now();
+            for axis in &self.axes {
                 let write = |raw: &mut [u8]| {
                     pdo::encode_rx(&mut raw[..pdo::RX_BYTES], 0, axis.target);
                 };
-                match &running.group {
+                match &group {
                     OpGroup::NoDc(g) => {
-                        if let Ok(sd) = g.subdevice(&running.maindevice, axis.subdevice) {
-                            write(&mut sd.io_raw_mut().outputs());
+                        if let Ok(sd) = g.subdevice(&maindevice, axis.subdevice) {
+                            write(sd.io_raw_mut().outputs());
                         }
                     }
                     OpGroup::Dc(g) => {
-                        if let Ok(sd) = g.subdevice(&running.maindevice, axis.subdevice) {
-                            write(&mut sd.io_raw_mut().outputs());
+                        if let Ok(sd) = g.subdevice(&maindevice, axis.subdevice) {
+                            write(sd.io_raw_mut().outputs());
                         }
                     }
                 }
             }
-            let _ = match &mut running.group {
-                OpGroup::NoDc(g) => g.tx_rx(&running.maindevice).await.map(|_| ()),
-                OpGroup::Dc(g) => g.tx_rx_dc(&running.maindevice).await.map(|_| ()),
-            };
-            smol::Timer::after(self.cfg.cycle).await;
+            let wait = match &group {
+                OpGroup::NoDc(g) => g.tx_rx(&maindevice).await.map(|_| self.cfg.cycle),
+                OpGroup::Dc(g) => g.tx_rx_dc(&maindevice).await.map(|r| r.extra.next_cycle_wait),
+            }
+            .unwrap_or(self.cfg.cycle);
+            smol::Timer::at(now + wait).await;
+        }
+        // Do not abandon the drives in OP: with the LRW traffic gone every
+        // one of them would drop out through its SM watchdog (AL status
+        // code 0x001B) — a communications fault from the drive's point of
+        // view. Walk them down OP → SAFEOP → PREOP instead; best effort.
+        match group {
+            OpGroup::NoDc(g) => degrade_to_pre_op(&maindevice, g).await,
+            OpGroup::Dc(g) => degrade_to_pre_op(&maindevice, g).await,
         }
         self.state = BusState::Init;
         self.events.push(BusEvent::BusStateChanged(BusState::Init));
         Ok(())
     }
 
+    /// One LRW cycle: outputs in, transact, inputs out.
+    ///
+    /// Bus health this cycle is `all_axes_responding` = every subdevice
+    /// reports OP **and** the LRW working counter equals the value learned
+    /// when the group reached OP (`working_counter_ok`). Either failing
+    /// reports the axes `DriveStatus::Offline` — a WKC failure means the
+    /// inputs are stale even though the AL status still looks healthy.
+    ///
+    /// With distributed clocks, `next_cycle_wait` is the delay to the next
+    /// exchange measured from the timestamp the caller takes *before* this
+    /// call (`let t = Instant::now(); exchange(..).await; Timer::at(t +
+    /// wait)`), which is how ethercrab defines `CycleInfo::next_cycle_wait`.
+    /// Pacing that way keeps the LRW phase-locked to SYNC0 on the reference
+    /// subdevice; free-running on the host clock drifts against the bus
+    /// clock until the drives' sync monitoring trips (AL status 0x001A).
+    /// Without DC it is `None`: pace on the host timer.
     async fn exchange(
         &mut self,
         outs: &[AxisOut],
@@ -546,6 +624,7 @@ impl Fieldbus for EthercatBackend {
             return Err(FieldbusError::InvalidState(self.state));
         }
         debug_assert_eq!(outs.len(), self.axes.len());
+        debug_assert_eq!(ins.len(), self.axes.len());
 
         // 1. write outputs (controlword from last cycle's statusword)
         {
@@ -555,14 +634,12 @@ impl Fieldbus for EthercatBackend {
                 match &running.group {
                     OpGroup::NoDc(g) => {
                         if let Ok(sd) = g.subdevice(&running.maindevice, axis.subdevice) {
-                            let mut io = sd.io_raw_mut();
-                            Self::write_axis_outputs(&mut io.outputs(), axis, out);
+                            Self::write_axis_outputs(sd.io_raw_mut().outputs(), axis, out);
                         }
                     }
                     OpGroup::Dc(g) => {
                         if let Ok(sd) = g.subdevice(&running.maindevice, axis.subdevice) {
-                            let mut io = sd.io_raw_mut();
-                            Self::write_axis_outputs(&mut io.outputs(), axis, out);
+                            Self::write_axis_outputs(sd.io_raw_mut().outputs(), axis, out);
                         }
                     }
                 }
@@ -570,26 +647,43 @@ impl Fieldbus for EthercatBackend {
         }
 
         // 2. one bus transaction
-        let responding = {
+        let (all_op, wkc_ok, next_cycle_wait) = {
             let running = self.running.as_mut().unwrap();
-            match &mut running.group {
+            let (all_op, wkc, next_cycle_wait) = match &running.group {
                 OpGroup::NoDc(g) => {
                     let r = g
                         .tx_rx(&running.maindevice)
                         .await
                         .map_err(|_| FieldbusError::Exchange("tx/rx"))?;
-                    r.is_in_state(SubDeviceState::Op)
+                    (r.is_in_state(SubDeviceState::Op), r.working_counter, None)
                 }
                 OpGroup::Dc(g) => {
                     let r = g
                         .tx_rx_dc(&running.maindevice)
                         .await
                         .map_err(|_| FieldbusError::Exchange("tx/rx"))?;
-                    let _cycle: &CycleInfo = &r.extra; // DC info available for diagnostics
-                    r.is_in_state(SubDeviceState::Op)
+                    (
+                        r.is_in_state(SubDeviceState::Op),
+                        r.working_counter,
+                        Some(r.extra.next_cycle_wait),
+                    )
+                }
+            };
+            let verdict = running.wkc.check(wkc);
+            if verdict.edge {
+                // Once per edge only — never per cycle on the RT path.
+                if verdict.ok {
+                    eprintln!("ecat: working counter back to {wkc}");
+                } else {
+                    eprintln!(
+                        "ecat: working counter {wkc}, expected {} — inputs stale, axes reported Offline",
+                        running.wkc.expected().unwrap_or(0)
+                    );
                 }
             }
+            (all_op, verdict.ok, next_cycle_wait)
         };
+        let responding = all_op && wkc_ok;
 
         if responding != self.was_responding {
             for i in 0..self.axes.len() {
@@ -603,9 +697,9 @@ impl Fieldbus for EthercatBackend {
         }
 
         // 3. read fresh inputs
-        for i in 0..self.axes.len() {
+        let n = pdo::tx_bytes(self.cfg.map_digital_inputs);
+        for (i, axis_in) in ins.iter_mut().enumerate() {
             let mut raw = [0u8; pdo::TX_BYTES_DIN];
-            let n = pdo::tx_bytes(self.cfg.map_digital_inputs);
             {
                 let running = self.running.as_ref().unwrap();
                 let sub = self.axes[i].subdevice;
@@ -622,16 +716,14 @@ impl Fieldbus for EthercatBackend {
                     }
                 }
             }
-            self.read_axis_inputs(i, &raw, responding, &mut ins[i]);
+            self.read_axis_inputs(i, &raw, responding, axis_in);
         }
 
         Ok(ExchangeStatus {
             all_axes_responding: responding,
             inputs_fresh: true,
-            // TODO(review fix, backend task): compare the LRW working counter
-            // against the value learned at OP and surface DC `next_cycle_wait`.
-            working_counter_ok: true,
-            next_cycle_wait: None,
+            working_counter_ok: wkc_ok,
+            next_cycle_wait,
         })
     }
 
@@ -641,6 +733,30 @@ impl Fieldbus for EthercatBackend {
 
     fn acyclic(&self) -> EthercatAcyclic {
         EthercatAcyclic {}
+    }
+}
+
+/// OP → SAFEOP → PREOP, so the subdevices are parked with their process-data
+/// SyncManagers closed instead of watchdog-faulting once the LRW traffic
+/// stops. Logs and gives up at the first failed transition — `stop()` must
+/// never fail because of it (the next `start()` re-scans from INIT anyway).
+///
+/// ethercrab 0.6: `SubDeviceGroup<_, _, Op, DC>::into_safe_op` then
+/// `SubDeviceGroup<_, _, SafeOp, DC>::into_pre_op`; both are generic over
+/// the DC marker, hence one helper for both `OpGroup` variants.
+async fn degrade_to_pre_op<DC>(
+    maindevice: &MainDevice<'_>,
+    group: SubDeviceGroup<MAX_SUBDEVICES, MAX_PDI, Op, DC>,
+) {
+    let group = match group.into_safe_op(maindevice).await {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("ecat: stop: OP → SAFEOP failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = group.into_pre_op(maindevice).await {
+        eprintln!("ecat: stop: SAFEOP → PREOP failed: {e}");
     }
 }
 
