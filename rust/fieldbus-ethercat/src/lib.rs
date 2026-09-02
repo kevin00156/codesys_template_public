@@ -21,6 +21,12 @@ pub mod cia402;
 pub mod config;
 pub mod pdo;
 
+/// Working-counter bookkeeping for the Linux backend's cycle path. Pure
+/// logic, so it is also compiled under `test` on every platform and its
+/// unit tests run on the Windows dev box.
+#[cfg(any(target_os = "linux", test))]
+mod wkc;
+
 #[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
