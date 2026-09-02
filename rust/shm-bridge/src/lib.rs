@@ -19,7 +19,7 @@ pub mod trace;
 pub use channel::{CmdReader, DataPublisher};
 pub use layout::*;
 pub use mapping::Mapping;
-pub use seqlock::{publish, snapshot, ReadError, SEQLOCK_MAX_RETRIES};
+pub use seqlock::{publish, reset, snapshot, ReadError, SEQLOCK_MAX_RETRIES};
 pub use trace::{TraceAxisSample, TraceHeader, TraceReader, TraceSample, TraceWriter};
 
 #[cfg(test)]
@@ -159,6 +159,43 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(torn, 0, "observed {torn} torn reads out of {reads}");
         assert!(reads > 0);
+    }
+
+    /// Reusing an existing segment across a daemon restart: reset() must
+    /// leave it rejecting (magic 0) with an even seq that differs from the
+    /// pre-reset value, and the next publish must continue cleanly.
+    #[test]
+    fn reset_invalidates_and_keeps_seq_monotonic() {
+        let m = cmd_mapping();
+        let mut src = PlcCommand::default();
+        src.header.magic = PLC_COMMAND_MAGIC;
+        src.header.version = PLC_COMMAND_VERSION;
+        src.header.cycle = 7;
+        src.machine.axes[0].control_flags = 0x30; // stale jog word
+        publish(&m, &src);
+        let before = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        assert_eq!(before, 2);
+
+        reset::<PlcCommand>(&m);
+        let after = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        assert_eq!(after % 2, 0, "reset must end on an even seq");
+        assert_ne!(after, before, "seq must move so a racing reader retries");
+
+        let mut got = PlcCommand::default();
+        assert_eq!(snapshot(&m, &mut got), Err(ReadError::MagicMismatch));
+        assert_eq!(got.machine.axes[0].control_flags, 0, "payload zeroed");
+
+        // A stale odd seq (writer died mid-write) is repaired too.
+        unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.store(9, Ordering::Release);
+        reset::<PlcCommand>(&m);
+        let repaired = unsafe { AtomicU32::from_ptr(m.ptr().add(8) as *mut u32) }.load(Ordering::Acquire);
+        assert_eq!(repaired, 10);
+
+        // Publishing afterwards continues from the reset seq.
+        publish(&m, &src);
+        snapshot(&m, &mut got).expect("valid after publish");
+        assert_eq!(got.header.seq, 12);
+        assert_eq!(got.header.cycle, 7);
     }
 
     #[test]

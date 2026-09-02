@@ -117,6 +117,65 @@ mod linux {
                 })
             }
         }
+
+        /// Open `/dev/shm/<name>` if it exists, otherwise create it; force
+        /// `mode`, grow it to at least `size` and map the first `size` bytes.
+        ///
+        /// Unlike [`Mapping::create`] this **keeps the segment's inode**. The
+        /// Go bridge opens `plc_data`/`plc_cmd` once at start-up and never
+        /// re-opens them, so an unlink-and-recreate on daemon restart would
+        /// leave the bridge reading and writing an orphaned inode forever
+        /// (frozen data, commands that never arrive). Reusing the inode keeps
+        /// the bridge's mappings live across daemon restarts.
+        ///
+        /// The contents are whatever the previous owner left. Callers that
+        /// need a clean "no writer yet" state must run
+        /// `seqlock::reset::<T>()` on the result — it zeroes the payload under
+        /// the seqlock protocol so a concurrent reader never latches a torn
+        /// old/zero mix. The file is only ever grown, never shrunk: shrinking
+        /// a file another process has mapped makes its accesses SIGBUS.
+        pub fn open_or_create(name: &str, size: usize, mode: u32) -> io::Result<Mapping> {
+            assert!(size > 0);
+            let c_name = CString::new(format!("/{name}"))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))?;
+
+            // Safety: FFI calls with a valid, NUL-terminated name; `st` is a
+            // plain C struct for which all-zero is a valid initial value.
+            unsafe {
+                let fd = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let guard = FdGuard(fd);
+                if libc::fchmod(fd, mode as libc::mode_t) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut st: libc::stat = core::mem::zeroed();
+                if libc::fstat(fd, &mut st) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if (st.st_size as u64) < size as u64 && libc::ftruncate(fd, size as libc::off_t) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let ptr = libc::mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                if ptr == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
+                drop(guard);
+                Ok(Mapping {
+                    ptr: ptr as *mut u8,
+                    len: size,
+                    backing: Backing::Shm,
+                })
+            }
+        }
     }
 
     struct FdGuard(libc::c_int);
@@ -151,5 +210,10 @@ impl Mapping {
                 std::env::consts::OS
             ),
         ))
+    }
+
+    /// See the Linux implementation; unsupported elsewhere.
+    pub fn open_or_create(name: &str, size: usize, mode: u32) -> io::Result<Mapping> {
+        Self::create(name, size, mode)
     }
 }
