@@ -1,0 +1,31 @@
+# motion-daemon configuration — every key with its default. Copy to
+# /opt/motion-daemon/motion-daemon.conf (see motion-daemon.service.unit).
+# Format: key = value, '#' starts a comment. CLI flags override the file.
+# The daemon refuses to start on an invalid value (non-finite numbers, zero
+# kinematics, fractional counts) instead of running with it.
+
+backend = sim                 # sim | ethercat — the real IPC runs ethercat
+axes = 4                      # served axes, 1..=4 (the shm layout has 4 slots; unserved slots publish zeros)
+cycle_ms = 2                  # control cycle, 0.25..=1000 ms (EtherCAT CSP: 1)
+ifname =                      # EtherCAT NIC, e.g. enp2s0 (required for backend = ethercat)
+
+# Kinematic limits in user units (all finite and > 0)
+max_vel = 1000                # velocity clamp for every command, units/s
+acc = 500                     # jog / move acceleration, units/s²
+dec = 500                     # move deceleration, units/s²
+stop_dec = 2000               # MC_Stop / EMS deceleration, units/s² (0 would make EMS inert — rejected)
+
+# Simulation backend
+sim_tau_ms = 30               # first-order drive lag of the sim model, ms
+
+# EtherCAT backend
+scale = 10000                 # drive increments per user unit (finite, non-zero; negative flips direction)
+ecat_dc = true                # distributed-clocks SYNC0 phase lock (true|false)
+first_axis_subdevice = 0      # chain position of the first axis drive (couplers before it shift this)
+
+# Diagnostics
+trace_seconds = 60            # /dev/shm/plc_trace ring window, 0..=600 s (0 = trace off)
+
+# Supervision
+cmd_timeout_ms = 1000         # command dead-man: strip latched jog bits after this long without a new message from the bridge (0 = off)
+shutdown_timeout_ms = 2000    # max time of the EMS-ramp phase on SIGTERM before the drives are disabled regardless

@@ -3,22 +3,37 @@
 //! had), runs `motion-core` against a `fieldbus-api` backend, and pushes
 //! axis state to the untouched Go bridge + Svelte HMI.
 //!
-//! Cycle order (EtherCAT-style: bus exchange at a fixed phase, compute
-//! after): pace → exchange(prev outs) → latch command → tick state machines
-//! → publish plc_data.
+//! `run()` is timing, segment ownership and the bus calls; everything that
+//! happens *between* two exchanges — command latch, state machines, publish,
+//! dead-man, controlled stop — lives in [`engine::Engine`] so it can be unit
+//! tested without a clock or a bus.
 
+mod cmdflags;
 mod config;
+mod engine;
 mod rt;
 
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fieldbus_api::{AxisIn, AxisOut, BusState, DriveStatus, Fieldbus};
-use motion_core::{AxisRequest, MachineControl};
 use shm_bridge::{
-    layout, trace, CmdReader, DataPublisher, Mapping, TraceSample, TraceWriter,
-    SIZE_PLC_COMMAND, SIZE_PLC_DATA,
+    layout, trace, Mapping, PlcCommand, PlcData, Segment, TraceSample, TraceWriter,
 };
+
+use engine::{Engine, EngineConfig, ShutdownPhase};
+
+/// `TraceSample.status_bits`. b0..b2 are documented in `shm_bridge::trace`;
+/// b3/b4 are new here and mirrored by the Go trace decoder.
+mod status_bits {
+    pub const EXCHANGE_ERROR: u8 = 1 << 0;
+    pub const CMD_FRESH: u8 = 1 << 1;
+    pub const CMD_VALID: u8 = 1 << 2;
+    /// This wake missed at least one whole deadline (pacing resynced).
+    pub const OVERRUN: u8 = 1 << 3;
+    /// `ExchangeStatus::working_counter_ok` was false.
+    pub const WKC_ERROR: u8 = 1 << 4;
+}
 
 fn main() -> ExitCode {
     let cfg = match config::parse(std::env::args()) {
@@ -75,6 +90,30 @@ fn main() -> ExitCode {
     }
 }
 
+/// Open one of the seqlock segments the way a daemon restart needs it.
+///
+/// `open_or_create` keeps the inode: the Go bridge maps `plc_data`/`plc_cmd`
+/// once at start-up and never re-opens them, so an unlink-and-recreate
+/// would leave it on an orphaned page forever (frozen data, commands that
+/// never arrive). `reset` then zeroes the payload *under the seqlock
+/// protocol* — a bridge reading mid-reset sees a clean `MagicMismatch`
+/// ("PLC not connected"), never a torn old/zero mix, and a stale command
+/// word from the previous life cannot be latched. Modes pre-grant what the
+/// bridge unit's ExecStartPre chmod would widen (0644 data, 0666 command).
+fn open_segment<T: Segment>(mode: u32) -> std::io::Result<Mapping> {
+    let size = core::mem::size_of::<T>();
+    let existed = std::path::Path::new("/dev/shm").join(T::NAME).exists();
+    let map = Mapping::open_or_create(T::NAME, size, mode)?;
+    shm_bridge::reset::<T>(&map);
+    eprintln!(
+        "motion-daemon: {} /dev/shm/{} ({size} B, mode {mode:o}){}",
+        if existed { "reused" } else { "created" },
+        T::NAME,
+        if existed { ", payload reset" } else { "" },
+    );
+    Ok(map)
+}
+
 fn run<B: Fieldbus>(mut bus: B, cfg: &config::Config) -> Result<(), Box<dyn std::error::Error>> {
     smol::block_on(async {
         rt::install_shutdown_signals();
@@ -85,26 +124,20 @@ fn run<B: Fieldbus>(mut bus: B, cfg: &config::Config) -> Result<(), Box<dyn std:
             eprintln!("motion-daemon: axis{i} capability: {cap:?}");
         }
 
-        // Segment creation is the daemon's job now (CODESYS did this via
-        // SysSharedMemoryCreate). Modes pre-grant what the bridge unit's
-        // ExecStartPre chmod would widen: world-readable data, world-writable
-        // command.
-        let data_map = Mapping::create(layout::NAME_PLC_DATA, SIZE_PLC_DATA, 0o644)?;
-        let cmd_map = Mapping::create(layout::NAME_PLC_COMMAND, SIZE_PLC_COMMAND, 0o666)?;
+        // Segment ownership is the daemon's job now (CODESYS did this via
+        // SysSharedMemoryCreate).
+        let data_map = open_segment::<PlcData>(0o644)?;
+        let cmd_map = open_segment::<PlcCommand>(0o666)?;
         eprintln!(
-            "motion-daemon: created /dev/shm/{{{},{}}} ({} + {} B), backend {:?}, {} axes, cycle {:?}",
-            layout::NAME_PLC_DATA,
-            layout::NAME_PLC_COMMAND,
-            SIZE_PLC_DATA,
-            SIZE_PLC_COMMAND,
-            cfg.backend,
-            cfg.axes,
-            cfg.cycle
+            "motion-daemon: backend {:?}, {} axes, cycle {:?}, cmd dead-man {:?}, shutdown timeout {:?}",
+            cfg.backend, cfg.axes, cfg.cycle, cfg.cmd_timeout, cfg.shutdown_timeout
         );
 
         // Trace ring: one fixed 256 B sample per cycle for the HMI's
         // watch/trace panels. Off the command path — losing it costs
-        // diagnostics, never motion.
+        // diagnostics, never motion. Created fresh (unlike the seqlock
+        // segments): its Go reader remaps on inode change and wants zero
+        // pages plus a new epoch.
         let mut tracer = if cfg.trace_seconds > 0 {
             let period_ns = cfg.cycle.as_nanos() as u64;
             let capacity = trace::capacity_for(cfg.trace_seconds, period_ns);
@@ -127,131 +160,117 @@ fn run<B: Fieldbus>(mut bus: B, cfg: &config::Config) -> Result<(), Box<dyn std:
         };
         let t_epoch = Instant::now(); // pairs with the header's epoch_unix_ns
 
-        let mut publisher = DataPublisher::new(data_map);
-        let mut cmd = CmdReader::new(cmd_map);
-        let mut machine = MachineControl::new(cfg.axes, cfg.params);
+        let mut engine = Engine::new(
+            EngineConfig {
+                axes: cfg.axes,
+                params: cfg.params,
+                cmd_timeout: cfg.cmd_timeout,
+                shutdown_timeout: cfg.shutdown_timeout,
+            },
+            data_map,
+            cmd_map,
+            Instant::now(),
+        );
 
         let n = cfg.axes;
         let dt = cfg.cycle.as_secs_f64();
         let mut ins = vec![AxisIn::default(); n];
         let mut outs = vec![AxisOut::default(); n];
-        let mut reqs = vec![AxisRequest::default(); n];
 
-        // plc_cmd starts zeroed (magic 0) until the bridge's first write;
-        // log the valid/invalid edges once instead of every cycle.
-        let mut cmd_ok = false;
-        let mut exchange_err: Option<fieldbus_api::FieldbusError> = None;
-
+        let mut overruns: u64 = 0;
+        let mut last_overrun_log: Option<Instant> = None;
         let mut next = Instant::now() + cfg.cycle;
         let mut last_wake: Option<Instant> = None;
-        while rt::running() {
+        loop {
             smol::Timer::at(next).await;
-            next += cfg.cycle;
             let wake = Instant::now();
             let period_ns = last_wake.map_or(0, |w| (wake - w).as_nanos() as u32);
             last_wake = Some(wake);
 
             // 1. bus exchange: publish last cycle's outputs, read fresh inputs
-            let exchange_ok = match bus.exchange(&outs, &mut ins).await {
-                Ok(_) => {
-                    if exchange_err.take().is_some() {
-                        eprintln!("motion-daemon: exchange recovered");
-                    }
-                    true
-                }
-                Err(e) => {
-                    if exchange_err != Some(e) {
-                        eprintln!("motion-daemon: exchange: {e}");
-                        exchange_err = Some(e);
-                    }
-                    false // keep pacing; stale ins, no new outs
-                }
-            };
+            let exchange = bus.exchange(&outs, &mut ins).await;
             let exchange_ns = wake.elapsed().as_nanos() as u32;
 
-            let mut fresh = false;
-            if exchange_ok {
-                // 2. latch the HMI command (PRG_ShmPublisher semantics)
-                fresh = match cmd.poll() {
-                    Ok(f) => {
-                        if !cmd_ok {
-                            eprintln!("motion-daemon: plc_cmd writer connected");
-                            cmd_ok = true;
-                        }
-                        f
-                    }
-                    Err(_) if !cmd_ok => false, // no writer yet — expected at boot
-                    Err(e) => {
-                        eprintln!("motion-daemon: plc_cmd read: {e}");
-                        cmd_ok = false;
-                        false
-                    }
-                };
-                let c = *cmd.current();
-                for i in 0..n {
-                    let a = &c.machine.axes[i];
-                    reqs[i] = AxisRequest {
-                        word: a.control_flags,
-                        jog_vel: a.jog_vel,
-                        move_abs_pos: a.move_abs_pos,
-                        move_abs_vel: a.move_abs_vel,
-                        fresh,
-                    };
-                }
-
-                // 3. state machines
-                machine.tick(c.machine.control_flags, &reqs, &ins, dt, &mut outs);
-
-                // 4. publish plc_data
-                let d = &mut publisher.data;
-                d.system.temperature = 25.0;
-                d.system.status_flags = u32::from(bus.bus_state() == BusState::Op);
-                d.system.alarm_flags = 0;
-                for i in 0..n {
-                    let st = machine.status(i, &ins[i]);
-                    let a = &mut d.machine.axes[i];
-                    a.act_pos = ins[i].act_pos;
-                    a.act_vel = ins[i].act_vel;
-                    a.set_pos = st.set_pos;
-                    a.set_vel = st.set_vel;
-                    a.step = st.step;
-                    a.flags = st.flags;
-                    a.error_id = st.error_id;
-                }
-                d.machine.run_state = MachineControl::run_state(c.machine.control_flags);
-                d.machine.alarms = 0;
-                d.production.n_production_state = c.production.n_production_state;
-                publisher.publish();
-
-                // 5. bus events → log
-                while let Some(ev) = bus.poll_event() {
-                    eprintln!("motion-daemon: bus event: {ev:?}");
+            // 2. pace the next wake: DC phase hint from the bus if it has
+            // one, overrun resync otherwise (see engine::next_deadline).
+            let dc_wait = exchange.as_ref().ok().and_then(|s| s.next_cycle_wait);
+            let deadline = next;
+            let pace = engine::next_deadline(deadline, wake, cfg.cycle, dc_wait);
+            next = pace.next;
+            if pace.overrun {
+                overruns += 1;
+                // Rate-limited: a stalled box would otherwise log per cycle.
+                if last_overrun_log.map_or(true, |t| wake - t >= Duration::from_secs(1)) {
+                    eprintln!(
+                        "motion-daemon: cycle overrun #{overruns}: woke {:?} late, resynced",
+                        wake.saturating_duration_since(deadline)
+                    );
+                    last_overrun_log = Some(wake);
                 }
             }
 
-            // 6. trace sample — every cycle, *including* exchange-error ones
+            // 3. command latch → state machines → publish (or the controlled
+            // stop once the shutdown signal arrived)
+            let bus_state = bus.bus_state();
+            let (report, done) = if rt::running() {
+                (engine.cycle(wake, &exchange, &ins, &mut outs, bus_state, dt), false)
+            } else if rt::force_quit() {
+                eprintln!("motion-daemon: second signal, skipping the controlled stop");
+                break;
+            } else {
+                let (r, phase) =
+                    engine.shutdown_step(wake, &exchange, &ins, &mut outs, bus_state, dt);
+                (r, phase == ShutdownPhase::Done)
+            };
+
+            // 4. bus events → log
+            while let Some(ev) = bus.poll_event() {
+                eprintln!("motion-daemon: bus event: {ev:?}");
+            }
+
+            // 5. trace sample — every cycle, *including* exchange-error ones
             // (the fault instant is exactly what a trace is for). On error
             // cycles the machine state is the last published one and `ins`
             // is stale; status_bits bit0 marks them.
             if let Some(t) = tracer.as_mut() {
-                let status_bits = u8::from(!exchange_ok)
-                    | u8::from(fresh) << 1
-                    | u8::from(cmd_ok) << 2;
+                let mut bits = 0u8;
+                if !report.exchange_ok {
+                    bits |= status_bits::EXCHANGE_ERROR;
+                }
+                if report.fresh {
+                    bits |= status_bits::CMD_FRESH;
+                }
+                if report.cmd_ok {
+                    bits |= status_bits::CMD_VALID;
+                }
+                if pace.overrun {
+                    bits |= status_bits::OVERRUN;
+                }
+                if report.wkc_error {
+                    bits |= status_bits::WKC_ERROR;
+                }
                 let s = trace_sample(
-                    &publisher.data,
+                    engine.data(),
                     &ins,
                     &outs,
-                    bus.bus_state(),
+                    bus_state,
                     (wake - t_epoch).as_nanos() as u64,
                     period_ns,
                     exchange_ns,
-                    status_bits,
+                    bits,
                 );
                 t.push(&s);
             }
+
+            if done {
+                break;
+            }
         }
 
-        eprintln!("motion-daemon: shutting down");
+        eprintln!(
+            "motion-daemon: stopping bus ({overruns} overruns, {} WKC errors)",
+            engine.wkc_errors()
+        );
         bus.stop().await?;
         Ok(())
     })
@@ -287,9 +306,14 @@ fn trace_sample(
         run_state: d.machine.run_state,
         axes: Default::default(),
     };
-    for (i, input) in ins.iter().enumerate() {
-        let st = &d.machine.axes[i];
-        s.axes[i] = shm_bridge::TraceAxisSample {
+    for (((sample, st), input), out) in s
+        .axes
+        .iter_mut()
+        .zip(&d.machine.axes)
+        .zip(ins)
+        .zip(outs)
+    {
+        *sample = shm_bridge::TraceAxisSample {
             act_pos: input.act_pos,
             act_vel: input.act_vel,
             set_pos: st.set_pos,
@@ -309,8 +333,8 @@ fn trace_sample(
             io_bits: u32::from(input.pos_limit)
                 | u32::from(input.neg_limit) << 1
                 | u32::from(input.homed) << 2
-                | u32::from(outs[i].enable) << 3
-                | u32::from(outs[i].fault_reset) << 4,
+                | u32::from(out.enable) << 3
+                | u32::from(out.fault_reset) << 4,
         };
     }
     s

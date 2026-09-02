@@ -1,0 +1,60 @@
+# Production unit for the Rust motion daemon (the CODESYS replacement: owns
+# /dev/shm/plc_{data,cmd,trace}, runs motion-core against the EtherCAT NIC).
+# Install as /etc/systemd/system/motion-daemon.service next to
+# plc_bridge.service; the config file it points at is documented in
+# scripts/motion-daemon.conf.example.
+[Unit]
+Description=motion-daemon — EtherCAT motion control + PLC shm publisher
+After=network-online.target
+Wants=network-online.target
+# The bridge maps the segments once at start-up and never re-opens them; let
+# the daemon create them first. (A daemon *restart* keeps the inodes, so an
+# already-running bridge stays live — see shm_bridge::Mapping::open_or_create.)
+Before=plc_bridge.service
+# CODESYS and the daemon cannot share the NIC (both want the raw EtherCAT
+# socket) nor the shm segment names. Starting one stops the other.
+Conflicts=codesyscontrol.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/motion-daemon
+ExecStart=/opt/motion-daemon/motion-daemon --config /opt/motion-daemon/motion-daemon.conf
+# Root, deliberately: raw AF_PACKET sockets for EtherCAT, mlockall,
+# SCHED_FIFO, and creating /dev/shm/plc_{data,cmd} with the modes the bridge
+# expects (0644 data / 0666 command — the daemon sets them, so the bridge
+# unit's ExecStartPre chmod becomes redundant but stays harmless).
+User=root
+Restart=on-failure
+RestartSec=2
+
+# ── Real-time discipline (kickoff §4) ──────────────────────────────────────
+# Pin the cycle thread to core 3; pair it with isolcpus=3 nohz_full=3
+# rcu_nocbs=3 on the kernel command line so nothing else is scheduled there
+# and the 1 ms cycle sees only its own jitter.
+CPUAffinity=3
+# SCHED_FIFO at priority 80: above every default kernel thread except the
+# per-CPU IRQ/timer threads on a PREEMPT_RT kernel — the daemon must win
+# against any non-RT work but never starve the NIC's IRQ thread that feeds it.
+# The binary also calls sched_setscheduler itself (rt::set_fifo); this is the
+# belt to that brace and applies to the process before main() runs.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
+# mlockall(MCL_CURRENT|MCL_FUTURE) in rt::lock_memory needs the RLIMIT lifted
+# or the call fails and the RT path can page-fault (a first-touch fault is a
+# missed cycle).
+LimitMEMLOCK=infinity
+
+# ── Shutdown contract ──────────────────────────────────────────────────────
+# SIGTERM starts a *controlled* stop, not an exit: the daemon keeps exchanging
+# and (1) ramps every axis to standstill under EMS deceleration — bounded by
+# shutdown_timeout_ms in the config, default 2 s — then (2) sends
+# enable=false for 10 cycles so the drives walk the 402 Shutdown transition
+# under power instead of coasting when the bus drops, then releases the bus.
+# A second SIGTERM skips straight to releasing the bus. TimeoutStopSec must
+# comfortably exceed shutdown_timeout_ms + bus release; at 10 s systemd's
+# SIGKILL only ever lands on a daemon that is truly wedged.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -8,24 +8,42 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Cleared by the first SIGINT/SIGTERM: the cycle loop leaves normal
+/// operation and runs the controlled stop (EMS ramp, then drive disable —
+/// see `engine::Engine::shutdown_step`).
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
+
+/// Set by a *second* SIGINT/SIGTERM while the controlled stop is running:
+/// the loop skips straight to `bus.stop()`. The operator asked twice, and
+/// systemd sends SIGKILL after `TimeoutStopSec` regardless — better to cut
+/// power under our control than to be killed mid-exchange.
+pub static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 
 pub fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
 }
 
+pub fn force_quit() -> bool {
+    FORCE_QUIT.load(Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::RUNNING;
+    use super::{FORCE_QUIT, RUNNING};
     use std::io;
     use std::sync::atomic::Ordering;
 
     extern "C" fn on_signal(_sig: libc::c_int) {
-        RUNNING.store(false, Ordering::Relaxed);
+        // First signal: stop running. Second: force. `swap` is one atomic
+        // RMW — still async-signal-safe.
+        if !RUNNING.swap(false, Ordering::Relaxed) {
+            FORCE_QUIT.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// SIGINT/SIGTERM flip [`super::RUNNING`]; the cycle loop drains and
-    /// disables the drives before exiting.
+    /// SIGINT/SIGTERM flip [`super::RUNNING`] (first) and
+    /// [`super::FORCE_QUIT`] (second); the cycle loop keeps exchanging
+    /// through the controlled stop and only then releases the bus.
     pub fn install_shutdown_signals() {
         // Safety: on_signal is async-signal-safe (one atomic store).
         unsafe {
