@@ -15,6 +15,10 @@
 //! `--enable` additionally walks the CiA 402 power chain to Operation
 //! Enabled and holds the current position (no motion). Default off: plain
 //! cyclic exchange with drives left disabled.
+//!
+//! Ctrl-C / SIGTERM during the run break the loop and go through the normal
+//! `stop()` (drives disabled, bus released) before the report is printed —
+//! the bus is never left with an enabled drive and no master frames.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -29,10 +33,27 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use fieldbus_api::{AxisIn, AxisOut, Fieldbus, Setpoint};
     use fieldbus_ethercat::{AxisMapping, EcatConfig, EthercatBackend};
+
+    /// Set by SIGINT/SIGTERM while the cyclic loop runs; the loop breaks and
+    /// the regular `stop()` path runs (with `--enable` that is what disables
+    /// the drive again — a plain process kill would leave it enabled).
+    static STOP: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        STOP.store(true, Ordering::SeqCst);
+    }
+    fn arm_signals() {
+        // Safety: on_signal is async-signal-safe (one atomic store).
+        unsafe {
+            let h = on_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGINT, h);
+            libc::signal(libc::SIGTERM, h);
+        }
+    }
 
     struct Args {
         ifname: String,
@@ -72,9 +93,13 @@ mod linux {
                     i += 1;
                 }
                 "--cycle-us" => {
-                    a.cycle = Duration::from_micros(
-                        val(i)?.parse().map_err(|_| "bad --cycle-us".to_string())?,
-                    );
+                    let us: u64 = val(i)?.parse().map_err(|_| "bad --cycle-us".to_string())?;
+                    if us == 0 {
+                        // 0 → cycles = usize::MAX: a busy loop with unbounded
+                        // sample vectors, under mlockall.
+                        return Err("--cycle-us must be > 0".into());
+                    }
+                    a.cycle = Duration::from_micros(us);
                     i += 1;
                 }
                 "--duration-s" => {
@@ -234,11 +259,23 @@ mod linux {
         let mut outs = vec![AxisOut::default(); args.axes];
         let mut ins = vec![AxisIn::default(); args.axes];
         let mut offline_cycles = 0usize;
+        let mut wkc_errors = 0usize;
         let mut xchg_errors = 0usize;
+        let mut interrupted = false;
+
+        // Armed only now: a Ctrl-C during the scan/OP transition still
+        // terminates as before (nothing is enabled yet); from here on it must
+        // go through `stop()`.
+        arm_signals();
 
         let mut next = Instant::now() + args.cycle;
         let mut last_wake: Option<Instant> = None;
         for _ in 0..cycles {
+            if STOP.load(Ordering::SeqCst) {
+                interrupted = true;
+                println!("bringup: signal received — stopping bus");
+                break;
+            }
             smol::Timer::at(next).await;
             let now = Instant::now();
             wake_late.push(now.saturating_duration_since(next));
@@ -272,6 +309,9 @@ mod linux {
                     if !st.all_axes_responding {
                         offline_cycles += 1;
                     }
+                    if !st.working_counter_ok {
+                        wkc_errors += 1;
+                    }
                 }
                 Err(_) => xchg_errors += 1,
             }
@@ -282,22 +322,30 @@ mod linux {
             }
         }
 
-        println!("\n=== cyclic timing over {} cycles @ {:?} ===", cycles, args.cycle);
+        // Release the bus BEFORE the report: sorting three ~10k-sample vectors
+        // and printing is a window with no frames on the wire, which with
+        // `--enable` means an Operation-Enabled drive watching its watchdog.
+        if let Err(e) = bus.stop().await {
+            eprintln!("bringup: stop: {e}");
+        }
+
+        let ran = wake_late.samples_us.len();
+        println!(
+            "\n=== cyclic timing over {ran}{} cycles @ {:?} ===",
+            if interrupted { format!(" of {cycles} (interrupted)") } else { String::new() },
+            args.cycle
+        );
         wake_late.report();
         period_jit.report();
         xchg_time.report();
         println!(
-            "offline cycles: {offline_cycles}   exchange errors: {xchg_errors}"
+            "offline cycles: {offline_cycles}   wkc errors: {wkc_errors}   exchange errors: {xchg_errors}"
         );
         for (i, axis) in ins.iter().enumerate() {
             println!(
-                "axis{i}: drive={:?} pos={:.4} vel={:.4} limits(-{},+{})",
+                "axis{i}: drive={:?} pos={:.4} vel={:.4} limits(-{},+{})   (last sample before stop)",
                 axis.drive, axis.act_pos, axis.act_vel, axis.neg_limit, axis.pos_limit
             );
-        }
-
-        if let Err(e) = bus.stop().await {
-            eprintln!("bringup: stop: {e}");
         }
         0
     }

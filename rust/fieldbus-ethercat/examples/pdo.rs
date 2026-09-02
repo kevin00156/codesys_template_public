@@ -9,18 +9,28 @@
 //! A background cyclic loop keeps the bus in OP (feeds the SM watchdog) and
 //! refreshes the process image; commands typed on stdin read/patch that image.
 //!
-//! **Safety:** writing an output byte *physically drives that terminal*. To
-//! keep this safe next to a live servo, any subdevice whose vendor id is
-//! Control Techniques / Nidec (0x000000F9) is treated as a **drive and its
-//! outputs are forced to zero every cycle** (controlword 0 ⇒ stays disabled,
-//! no motion); `wo`/`sb`/`cb` are refused on it. Only mailbox-less IO (the
-//! MKX) is writable. On quit, all outputs are zeroed before releasing the bus.
+//! **Safety:** writing an output byte *physically drives that terminal*, so
+//! writes are **allow-listed**: nothing is writable unless named in
+//! `--writable <node>[,<node>...]`, and every other node's outputs are driven
+//! as all-zero every cycle. On top of that, any subdevice whose vendor id is
+//! Control Techniques / Nidec (0x000000F9) is a **drive and stays hard-locked
+//! even if listed** (controlword 0 ⇒ stays disabled, no motion); `wo`/`sb`/`cb`
+//! on a locked node are refused with the reason. The effective writable set
+//! is printed at start-up. On quit — `q`, EOF, **Ctrl-C or SIGTERM** — every
+//! output is zeroed for a few cycles, then the group is degraded OP→SAFEOP→
+//! PREOP (best effort) so nodes leave OP cleanly instead of via watchdog.
+//!
+//! Every cycle checks the LRW **working counter** against the value learned
+//! on the first all-OP cycle: a node physically dropping off the tail of the
+//! chain is invisible to the AL-status check (its FPRD just returns zeros)
+//! but shows up as a WKC mismatch. `stats` reports expected/last/errors.
 //!
 //! Uses `ethercrab` directly (process data is below the `fieldbus-api`
 //! normalized-axis seam), same as `sdo`/`bringup`.
 //!
-//! Usage (needs root / CAP_NET_RAW):
-//!   pdo --ifname enp2s0 [--cycle-us 2000]
+//! Usage (needs root / CAP_NET_RAW; on the RT box launch it pinned, e.g.
+//! `sudo chrt -f 80 taskset -c 3 pdo ...` — the tool only does `mlockall`):
+//!   pdo --ifname enp2s0 [--cycle-us 2000] [--writable <node>[,<node>...]]
 //!
 //! Commands (node = 0-based chain position; numbers take 0x-hex or decimal):
 //!   ls                          list nodes with input/output sizes + writable flag
@@ -31,7 +41,7 @@
 //!   cb <node> <bit>             clear one OUTPUT bit
 //!   watch <node>                print a node's inputs whenever they change
 //!   watch off                   stop all watches
-//!   stats [on|off]              per-cycle exchange(scan) + period timing; 'on' auto-prints ~1s
+//!   stats [on|off]              exchange(scan) + period timing, overruns, WKC; 'on' auto-prints ~1s
 //!   help / q
 
 #[cfg(not(target_os = "linux"))]
@@ -47,12 +57,14 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use ethercrab::{
         std::{ethercat_now, tx_rx_task},
-        MainDevice, MainDeviceConfig, PduStorage, SubDeviceState, Timeouts,
+        subdevice_group::{NoDc, Op},
+        MainDevice, MainDeviceConfig, PduStorage, SubDeviceGroup, SubDeviceState, Timeouts,
     };
 
     const MAX_FRAMES: usize = 16;
@@ -60,28 +72,67 @@ mod linux {
     const MAX_SUBDEVICES: usize = 16;
     const MAX_PDI: usize = 128;
     type Storage = PduStorage<MAX_FRAMES, MAX_PDU_DATA>;
+    /// The group once `request_into_op` has been issued (no DC in this tool).
+    type OpGroup = SubDeviceGroup<MAX_SUBDEVICES, MAX_PDI, Op, NoDc>;
 
     /// Control Techniques / Nidec EtherCAT vendor id — nodes matching this are
-    /// treated as drives: outputs forced to zero, writes refused.
+    /// treated as drives: outputs forced to zero, writes refused even when
+    /// listed in `--writable`.
     const VENDOR_CONTROL_TECHNIQUES: u32 = 0x0000_00f9;
+
+    /// Set by SIGINT/SIGTERM once the cyclic loop is live, so the loop exits
+    /// and the zero-outputs epilogue always runs (the `watch` prompt tells the
+    /// operator to press Ctrl-C — that must not leave a relay energised).
+    static STOP: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_signal(_sig: libc::c_int) {
+        STOP.store(true, Ordering::SeqCst);
+    }
+    fn arm_signals() {
+        // Safety: on_signal is async-signal-safe (one atomic store).
+        unsafe {
+            let h = on_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGINT, h);
+            libc::signal(libc::SIGTERM, h);
+        }
+    }
+    fn disarm_signals() {
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+    }
+
+    /// Why (or whether) a node's outputs may be written from the console.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Lock {
+        /// Listed in `--writable` and not a drive.
+        Writable,
+        /// Not named in `--writable` — outputs driven as zero.
+        NotListed,
+        /// CT/Nidec drive (vendor 0xF9) — hard-locked regardless of the list.
+        Drive,
+    }
 
     struct Node {
         name: String,
         vendor: u32,
         in_len: usize,
         out_len: usize,
-        writable: bool,
+        lock: Lock,
     }
 
     struct Args {
         ifname: String,
         cycle: Duration,
+        /// Nodes (0-based) whose outputs `wo`/`sb`/`cb` may touch.
+        writable: Vec<usize>,
     }
 
     fn parse_args() -> Result<Args, String> {
         let mut a = Args {
             ifname: String::new(),
             cycle: Duration::from_micros(2000),
+            writable: Vec::new(),
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -95,9 +146,21 @@ mod linux {
                     i += 1;
                 }
                 "--cycle-us" => {
-                    a.cycle = Duration::from_micros(
-                        val(i)?.parse().map_err(|_| "bad --cycle-us".to_string())?,
-                    );
+                    let us: u64 = val(i)?.parse().map_err(|_| "bad --cycle-us".to_string())?;
+                    if us == 0 {
+                        return Err("--cycle-us must be > 0 (0 would spin the bus flat out)".into());
+                    }
+                    a.cycle = Duration::from_micros(us);
+                    i += 1;
+                }
+                "--writable" => {
+                    for tok in val(i)?.split(',') {
+                        let tok = tok.trim();
+                        if tok.is_empty() {
+                            continue;
+                        }
+                        a.writable.push(parse_u32(tok).map_err(|e| format!("--writable: {e}"))? as usize);
+                    }
                     i += 1;
                 }
                 other => return Err(format!("unknown flag {other}")),
@@ -107,6 +170,8 @@ mod linux {
         if a.ifname.is_empty() {
             return Err("--ifname is required (e.g. --ifname enp2s0)".into());
         }
+        a.writable.sort_unstable();
+        a.writable.dedup();
         Ok(a)
     }
 
@@ -139,9 +204,24 @@ mod linux {
         format!("[{}] {}  set-bits: {:?}", bytes.len(), hex.join(" "), set)
     }
 
+    /// One ring's summary, computed on the cyclic thread (no allocation) and
+    /// shipped to the printer thread.
+    #[derive(Clone, Copy)]
+    struct Summary {
+        last: f64,
+        n: usize,
+        min: f64,
+        mean: f64,
+        p99: f64,
+        max: f64,
+    }
+
     /// Bounded ring of latency samples (µs) for on-demand min/mean/p99/max.
+    /// `scratch` is allocated once so `summary` never allocates on the
+    /// cyclic thread (it still sorts up to `cap` values — bounded work).
     struct Ring {
         buf: Vec<f64>,
+        scratch: Vec<f64>,
         cap: usize,
         next: usize,
         len: usize,
@@ -150,7 +230,14 @@ mod linux {
 
     impl Ring {
         fn new(cap: usize) -> Ring {
-            Ring { buf: vec![0.0; cap], cap, next: 0, len: 0, last: 0.0 }
+            Ring {
+                buf: vec![0.0; cap],
+                scratch: vec![0.0; cap],
+                cap,
+                next: 0,
+                len: 0,
+                last: 0.0,
+            }
         }
         fn push(&mut self, us: f64) {
             self.last = us;
@@ -160,36 +247,104 @@ mod linux {
                 self.len += 1;
             }
         }
-        /// (min, mean, p99, max) over the retained window.
-        fn summary(&self) -> Option<(f64, f64, f64, f64)> {
+        fn summary(&mut self) -> Option<Summary> {
             if self.len == 0 {
                 return None;
             }
-            let mut v: Vec<f64> = self.buf[..self.len].to_vec();
-            v.sort_by(|a, b| a.total_cmp(b));
-            let n = v.len();
+            let n = self.len;
+            let v = &mut self.scratch[..n];
+            v.copy_from_slice(&self.buf[..n]);
+            v.sort_unstable_by(|a, b| a.total_cmp(b));
             let mean = v.iter().sum::<f64>() / n as f64;
             let p99 = v[((n - 1) as f64 * 0.99) as usize];
-            Some((v[0], mean, p99, v[n - 1]))
+            Some(Summary {
+                last: self.last,
+                n,
+                min: v[0],
+                mean,
+                p99,
+                max: v[n - 1],
+            })
         }
     }
 
-    fn fmt_stats(xchg: &Ring, period: &Ring, target_us: f64, cycles: usize) -> String {
-        let fx = |r: &Ring| match r.summary() {
-            Some((mn, me, p9, mx)) => {
-                format!("min={mn:7.1} mean={me:7.1} p99={p9:7.1} max={mx:7.1}µs  (n={})", r.len)
-            }
+    /// Everything `stats` prints, captured on the cyclic thread as plain
+    /// numbers; formatting and the (blocking) write happen on the printer
+    /// thread.
+    struct StatsSnapshot {
+        cycles: usize,
+        target_us: f64,
+        xchg: Option<Summary>,
+        period: Option<Summary>,
+        overruns: usize,
+        xchg_errors: usize,
+        not_op_cycles: usize,
+        wkc_expected: Option<u16>,
+        wkc_last: u16,
+        wkc_errors: usize,
+    }
+
+    /// Cyclic thread → printer thread messages. The cyclic loop never touches
+    /// stdout itself: a slow terminal or a full pipe must not stall a cycle.
+    enum Out {
+        Line(String),
+        Stats(StatsSnapshot),
+    }
+
+    fn fmt_stats(s: &StatsSnapshot, rt: &str) -> String {
+        let fx = |r: &Option<Summary>| match r {
+            Some(s) => format!(
+                "min={:7.1} mean={:7.1} p99={:7.1} max={:7.1}µs  (n={})",
+                s.min, s.mean, s.p99, s.max, s.n
+            ),
             None => "no samples yet".to_string(),
         };
+        let wkc = match s.wkc_expected {
+            Some(exp) => format!("expected={exp} last={} errors={}", s.wkc_last, s.wkc_errors),
+            None => "not learned yet (waiting for the first all-OP cycle)".to_string(),
+        };
         format!(
-            "stats @ {cycles} cycles, target {target_us:.0}µs:\n  \
+            "stats @ {} cycles, target {:.0}µs:\n  \
              exchange(scan): last={:.1}µs  {}\n  \
              cycle period:   {}\n  \
-             note: no RT scheduling here — a systemd unit with SCHED_FIFO on isolcpus is much tighter",
-            xchg.last,
-            fx(xchg),
-            fx(period),
+             overruns={} (period realigned)  exchange errors={}  cycles with a node not in OP={}\n  \
+             wkc: {}\n  \
+             rt: {}",
+            s.cycles,
+            s.target_us,
+            s.xchg.map(|x| x.last).unwrap_or(0.0),
+            fx(&s.xchg),
+            fx(&s.period),
+            s.overruns,
+            s.xchg_errors,
+            s.not_op_cycles,
+            wkc,
+            rt,
         )
+    }
+
+    /// Best-effort `mlockall` (page faults inside the cycle are the classic
+    /// jitter source) and a report of the scheduling class we were launched
+    /// with. Priority is *not* raised here — the tool is meant to be started
+    /// via `chrt -f 80 taskset -c N`, and that is what the returned line
+    /// tells the operator to do if it was not.
+    fn try_rt_setup() -> String {
+        // Safety: plain libc calls on the current process/thread.
+        unsafe {
+            let mlock = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0;
+            let mut param: libc::sched_param = std::mem::zeroed();
+            libc::sched_getparam(0, &mut param);
+            let sched = match libc::sched_getscheduler(0) {
+                libc::SCHED_FIFO => format!("SCHED_FIFO prio {}", param.sched_priority),
+                libc::SCHED_RR => format!("SCHED_RR prio {}", param.sched_priority),
+                _ => "SCHED_OTHER — launch as `sudo chrt -f 80 taskset -c 3 pdo ...` for tight timing"
+                    .to_string(),
+            };
+            format!(
+                "mlockall={}  scheduler={sched}",
+                if mlock { "ok" } else { "FAILED (needs root/CAP_IPC_LOCK)" }
+            )
+        }
     }
 
     pub fn main() {
@@ -212,11 +367,17 @@ mod linux {
                 return 1;
             }
         };
+        // PDU timeout = a few cycles, not 100 ms: a single lost/late frame must
+        // not park the loop for ~50 cycles — that is the order of the nodes'
+        // SM watchdog (100 ms default), i.e. one dropped frame would cascade
+        // into every node falling to SAFEOP. Floor at 2 ms so a 500 µs cycle
+        // still tolerates a normal scheduling hiccup.
+        let pdu_timeout = (args.cycle * 4).max(Duration::from_millis(2));
         let maindevice = MainDevice::new(
             pdu_loop,
             Timeouts {
                 state_transition: Duration::from_secs(5),
-                pdu: Duration::from_millis(100),
+                pdu: pdu_timeout,
                 mailbox_response: Duration::from_secs(1),
                 ..Timeouts::default()
             },
@@ -230,6 +391,22 @@ mod linux {
                 return 1;
             }
         };
+
+        let rt = try_rt_setup();
+        eprintln!("pdo: rt: {rt}");
+        eprintln!("pdo: pdu timeout {pdu_timeout:?} (4 cycles, min 2 ms)");
+
+        // Printer thread: owns stdout. The cyclic thread only sends messages.
+        let (out_tx, out_rx) = mpsc::channel::<Out>();
+        let printer = std::thread::spawn(move || {
+            for msg in out_rx {
+                match msg {
+                    Out::Line(s) => println!("{s}"),
+                    Out::Stats(s) => println!("{}", fmt_stats(&s, &rt)),
+                }
+            }
+        });
+
         // Single-threaded I/O: drive the tx/rx task and the cyclic loop on ONE
         // LocalExecutor so the cyclic task polls tx/rx inline on the same thread
         // — no cross-thread wakeup (that handoff was the ~245µs saturation floor
@@ -243,10 +420,16 @@ mod linux {
         })
         .detach();
 
-        smol::block_on(ex.run(drive(&maindevice, &args)))
+        let code = smol::block_on(ex.run(drive(&maindevice, &args, out_tx)));
+        // `drive` dropped its sender; wait for queued output before exiting.
+        let _ = printer.join();
+        code
     }
 
-    async fn drive(maindevice: &MainDevice<'static>, args: &Args) -> i32 {
+    async fn drive(maindevice: &MainDevice<'static>, args: &Args, out_tx: mpsc::Sender<Out>) -> i32 {
+        let out = |s: String| {
+            let _ = out_tx.send(Out::Line(s));
+        };
         // Scan (PREOP), then bring the whole group to OP on default PDO — no
         // 402 config written, mirroring `bringup --axes 0 --no-dc`.
         let group = match maindevice
@@ -268,7 +451,7 @@ mod linux {
                 return 1;
             }
         };
-        let group = match group.request_into_op(maindevice).await {
+        let group: OpGroup = match group.request_into_op(maindevice).await {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("pdo: request OP: {e}");
@@ -276,9 +459,18 @@ mod linux {
             }
         };
 
+        // From here on the nodes are heading for OP with us as their master:
+        // every exit path must go through `release` (zero outputs, degrade).
+        arm_signals();
+
         // Drive the cycle until every subdevice reports OP (bounded).
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            if STOP.load(Ordering::SeqCst) {
+                eprintln!("pdo: interrupted while entering OP");
+                release(group, maindevice, args.cycle, true).await;
+                return 1;
+            }
             match group.tx_rx(maindevice).await {
                 Ok(r) => {
                     if r.is_in_state(SubDeviceState::Op) {
@@ -287,11 +479,13 @@ mod linux {
                 }
                 Err(e) => {
                     eprintln!("pdo: tx/rx while entering OP: {e}");
+                    release(group, maindevice, args.cycle, false).await;
                     return 1;
                 }
             }
             if Instant::now() > deadline {
                 eprintln!("pdo: timeout waiting for OP");
+                release(group, maindevice, args.cycle, true).await;
                 return 1;
             }
             smol::Timer::after(args.cycle).await;
@@ -300,24 +494,43 @@ mod linux {
 
         // Snapshot per-node identity + IO sizes, decide writability.
         let n = group.len();
+        if let Some(&bad) = args.writable.iter().find(|&&w| w >= n) {
+            eprintln!("pdo: --writable: no such node {bad} (have 0..{})", n.saturating_sub(1));
+            release(group, maindevice, args.cycle, true).await;
+            return 2;
+        }
         let mut nodes: Vec<Node> = Vec::with_capacity(n);
         for node in 0..n {
             let sd = match group.subdevice(maindevice, node) {
                 Ok(sd) => sd,
                 Err(e) => {
                     eprintln!("pdo: node {node}: {e}");
+                    release(group, maindevice, args.cycle, true).await;
                     return 1;
                 }
             };
             let io = sd.io_raw();
             let vendor = sd.identity().vendor_id;
-            let writable = vendor != VENDOR_CONTROL_TECHNIQUES;
+            let listed = args.writable.contains(&node);
+            let lock = if vendor == VENDOR_CONTROL_TECHNIQUES {
+                if listed {
+                    eprintln!(
+                        "pdo: --writable {node}: {} is a CT/Nidec drive (vendor 0xF9) — hard-locked, ignoring",
+                        sd.name()
+                    );
+                }
+                Lock::Drive
+            } else if listed {
+                Lock::Writable
+            } else {
+                Lock::NotListed
+            };
             nodes.push(Node {
                 name: sd.name().to_string(),
                 vendor,
                 in_len: io.inputs().len(),
                 out_len: io.outputs().len(),
-                writable,
+                lock,
             });
         }
 
@@ -327,10 +540,21 @@ mod linux {
         let mut last_watch: Vec<Vec<u8>> = nodes.iter().map(|nd| vec![0u8; nd.in_len]).collect();
 
         print_nodes(&nodes);
+        let writable: Vec<String> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, nd)| nd.lock == Lock::Writable)
+            .map(|(i, _)| i.to_string())
+            .collect();
+        if writable.is_empty() {
+            eprintln!("writable nodes: (none) — pass --writable <node>[,<node>] to allow wo/sb/cb");
+        } else {
+            eprintln!("writable nodes: {}", writable.join(","));
+        }
         eprintln!(
             "\ncommands: ls | ri <n> | ro <n> | wo <n> <off> <byte...> | sb/cb <n> <bit> | watch <n> | stats [on|off] | q"
         );
-        eprintln!("writing an output drives a REAL terminal. CT-drive outputs are locked to 0.\n");
+        eprintln!("writing an output drives a REAL terminal. Ctrl-C / q / EOF zero every output before releasing.\n");
 
         // stdin reader on its own thread → non-blocking drain in the cycle loop.
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
@@ -357,32 +581,55 @@ mod linux {
         // ── cyclic loop ─────────────────────────────────────────────────────
         let mut next = Instant::now() + args.cycle;
         let mut running = true;
-        let mut offline_warned = false;
         let mut xchg = Ring::new(4096);
         let mut period = Ring::new(4096);
         let mut last_wake: Option<Instant> = None;
         let mut cycles: usize = 0;
+        let mut overruns: usize = 0;
         let mut auto_stats = false;
         let mut last_stats = Instant::now();
         let target_us = args.cycle.as_secs_f64() * 1e6;
+        // Health tracking — each has an "edge" flag so a persistent condition
+        // prints once, not 500×/s.
+        let mut bus_ok = true;
+        let mut xchg_errors: usize = 0;
+        let mut xchg_err_run: usize = 0;
+        let mut not_op_cycles: usize = 0;
+        let mut op_warned = false;
+        let mut wkc_expected: Option<u16> = None;
+        let mut wkc_last: u16 = 0;
+        let mut wkc_errors: usize = 0;
+        let mut wkc_warned = false;
         while running {
             smol::Timer::at(next).await;
-            next += args.cycle;
-
             let woke = Instant::now();
+            next += args.cycle;
+            // Overrun: if we are more than a full cycle behind (a PDU timeout,
+            // a preemption), realign instead of letting `Timer::at` fire
+            // back-to-back — that would burst frames and fake the period stats.
+            if woke > next + args.cycle {
+                overruns += 1;
+                next = woke + args.cycle;
+            }
+
             if let Some(prev) = last_wake {
                 period.push((woke - prev).as_secs_f64() * 1e6);
             }
             last_wake = Some(woke);
             cycles += 1;
 
-            // 1. drive outputs (desired image; CT nodes stay all-zero forever)
-            for node in 0..n {
+            if STOP.load(Ordering::SeqCst) {
+                eprintln!("pdo: signal received — stopping");
+                break;
+            }
+
+            // 1. drive outputs (desired image; locked nodes stay all-zero forever)
+            for (node, desired) in out_desired.iter().enumerate() {
                 if let Ok(sd) = group.subdevice(maindevice, node) {
                     let mut io = sd.io_raw_mut();
                     let out = io.outputs();
                     if !out.is_empty() {
-                        out.copy_from_slice(&out_desired[node]);
+                        out.copy_from_slice(desired);
                     }
                 }
             }
@@ -391,44 +638,87 @@ mod linux {
             let t_ex = Instant::now();
             match group.tx_rx(maindevice).await {
                 Ok(r) => {
-                    let ok = r.is_in_state(SubDeviceState::Op);
-                    if !ok && !offline_warned {
-                        println!("pdo: WARNING a subdevice left OP (check the chain)");
-                        offline_warned = true;
-                    } else if ok {
-                        offline_warned = false;
+                    xchg.push(t_ex.elapsed().as_secs_f64() * 1e6);
+                    if !bus_ok {
+                        bus_ok = true;
+                        out(format!("pdo: exchange recovered after {xchg_err_run} error(s)"));
+                        xchg_err_run = 0;
+                    }
+
+                    // AL state of every node (sees a node dropping to SAFEOP/
+                    // PREOP, but NOT a node physically gone — see WKC below).
+                    let all_op = r.is_in_state(SubDeviceState::Op);
+                    if !all_op {
+                        not_op_cycles += 1;
+                        if !op_warned {
+                            out("pdo: WARNING a subdevice left OP (check the chain)".into());
+                            op_warned = true;
+                        }
+                    } else if op_warned {
+                        op_warned = false;
+                        out("pdo: all subdevices back in OP".into());
+                    }
+
+                    // Working counter: learned on the first all-OP cycle; a
+                    // mismatch afterwards means a node did not process the LRW
+                    // (dropped off the chain, or its SM is not running).
+                    wkc_last = r.working_counter;
+                    match wkc_expected {
+                        None => {
+                            if all_op {
+                                wkc_expected = Some(r.working_counter);
+                                out(format!("pdo: working counter learned: {}", r.working_counter));
+                            }
+                        }
+                        Some(exp) => {
+                            if r.working_counter != exp {
+                                wkc_errors += 1;
+                                if !wkc_warned {
+                                    out(format!(
+                                        "pdo: WARNING working counter {} != expected {exp} — a node dropped off the chain? (inputs may be stale)",
+                                        r.working_counter
+                                    ));
+                                    wkc_warned = true;
+                                }
+                            } else if wkc_warned {
+                                wkc_warned = false;
+                                out(format!("pdo: working counter back to {exp}"));
+                            }
+                        }
+                    }
+
+                    // 3. read fresh inputs
+                    for (node, snap) in in_snap.iter_mut().enumerate() {
+                        if let Ok(sd) = group.subdevice(maindevice, node) {
+                            let io = sd.io_raw();
+                            let inp = io.inputs();
+                            if !inp.is_empty() {
+                                snap.copy_from_slice(inp);
+                            }
+                        }
+                    }
+
+                    // 4. watch: print any watched node whose inputs changed
+                    for &node in &watch {
+                        if in_snap[node] != last_watch[node] {
+                            out(format!("  [watch] node {node} in {}", fmt_image(&in_snap[node])));
+                            last_watch[node].copy_from_slice(&in_snap[node]);
+                        }
                     }
                 }
                 Err(e) => {
-                    println!("pdo: exchange error: {e}");
-                    continue;
-                }
-            }
-            xchg.push(t_ex.elapsed().as_secs_f64() * 1e6);
-
-            // 3. read fresh inputs
-            for node in 0..n {
-                if let Ok(sd) = group.subdevice(maindevice, node) {
-                    let io = sd.io_raw();
-                    let inp = io.inputs();
-                    if !inp.is_empty() {
-                        in_snap[node].copy_from_slice(inp);
+                    // Not sampled into `xchg`: a timeout is not a scan time.
+                    xchg_errors += 1;
+                    xchg_err_run += 1;
+                    if bus_ok {
+                        bus_ok = false;
+                        out(format!("pdo: exchange error: {e} (bus down? still draining commands — 'q' works)"));
                     }
                 }
             }
 
-            // 4. watch: print any watched node whose inputs changed
-            for &node in &watch {
-                if in_snap[node] != last_watch[node] {
-                    println!(
-                        "  [watch] node {node} in {}",
-                        fmt_image(&in_snap[node])
-                    );
-                    last_watch[node].copy_from_slice(&in_snap[node]);
-                }
-            }
-
-            // 5. handle typed commands
+            // 5. handle typed commands — ALWAYS, even with the bus down, so
+            //    'q' is honoured when the cable is pulled.
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if cmd.is_empty() || cmd.starts_with('#') {
                     continue;
@@ -439,50 +729,99 @@ mod linux {
                     match tok.get(1).copied() {
                         Some("on") => {
                             auto_stats = true;
-                            println!("stats: auto-print on (~1s) — 'stats off' to stop");
+                            out("stats: auto-print on (~1s) — 'stats off' to stop".into());
                         }
                         Some("off") => {
                             auto_stats = false;
-                            println!("stats: auto-print off");
+                            out("stats: auto-print off".into());
                         }
-                        _ => println!("{}", fmt_stats(&xchg, &period, target_us, cycles)),
+                        _ => {
+                            let _ = out_tx.send(Out::Stats(StatsSnapshot {
+                                cycles,
+                                target_us,
+                                xchg: xchg.summary(),
+                                period: period.summary(),
+                                overruns,
+                                xchg_errors,
+                                not_op_cycles,
+                                wkc_expected,
+                                wkc_last,
+                                wkc_errors,
+                            }));
+                        }
                     }
                     continue;
                 }
                 match handle(&tok, &nodes, &in_snap, &mut out_desired, &mut watch, &mut last_watch) {
-                    Ok(Some(msg)) => println!("{msg}"),
+                    Ok(Some(msg)) => out(msg),
                     Ok(None) => {}
                     Err(Cmd::Quit) => running = false,
-                    Err(Cmd::Msg(e)) => println!("pdo: {e}"),
+                    Err(Cmd::Msg(e)) => out(format!("pdo: {e}")),
                 }
             }
 
             // 6. periodic stats auto-print
             if auto_stats && last_stats.elapsed() >= Duration::from_secs(1) {
-                println!("{}", fmt_stats(&xchg, &period, target_us, cycles));
+                let _ = out_tx.send(Out::Stats(StatsSnapshot {
+                    cycles,
+                    target_us,
+                    xchg: xchg.summary(),
+                    period: period.summary(),
+                    overruns,
+                    xchg_errors,
+                    not_op_cycles,
+                    wkc_expected,
+                    wkc_last,
+                    wkc_errors,
+                }));
                 last_stats = Instant::now();
             }
         }
 
         // ── safe stop: zero every output, flush a few cycles, then release ──
         eprintln!("pdo: zeroing outputs and releasing bus…");
-        for buf in &mut out_desired {
-            buf.iter_mut().for_each(|b| *b = 0);
-        }
+        release(group, maindevice, args.cycle, bus_ok).await;
+        0
+    }
+
+    /// The one exit path once we own an OP-bound group: drive all-zero
+    /// outputs for a few cycles (the physical safe state), then — if the bus
+    /// still answers — walk the group OP→SAFEOP→PREOP so nodes leave OP by
+    /// request instead of by SM-watchdog timeout (AL status 0x001B) when our
+    /// frames stop.
+    async fn release(group: OpGroup, maindevice: &MainDevice<'static>, cycle: Duration, degrade: bool) {
         for _ in 0..5 {
-            for node in 0..n {
+            for node in 0..group.len() {
                 if let Ok(sd) = group.subdevice(maindevice, node) {
-                    let mut io = sd.io_raw_mut();
-                    let out = io.outputs();
-                    if !out.is_empty() {
-                        out.copy_from_slice(&out_desired[node]);
-                    }
+                    sd.io_raw_mut().outputs().fill(0);
                 }
             }
             let _ = group.tx_rx(maindevice).await;
-            smol::Timer::after(args.cycle).await;
+            smol::Timer::after(cycle).await;
         }
-        0
+        // Outputs are zero on the wire now. The state degrade is nice-to-have
+        // and may sit in state_transition timeouts on a broken chain, so let
+        // a second Ctrl-C terminate the process from here on.
+        disarm_signals();
+        if !degrade {
+            eprintln!("pdo: bus not responding — skipping OP→SAFEOP→PREOP degrade");
+            return;
+        }
+        match group.into_safe_op(maindevice).await {
+            Ok(g) => match g.into_pre_op(maindevice).await {
+                Ok(_) => eprintln!("pdo: nodes degraded to PREOP"),
+                Err(e) => eprintln!("pdo: SAFEOP→PREOP: {e} (ignored)"),
+            },
+            Err(e) => eprintln!("pdo: OP→SAFEOP: {e} (ignored)"),
+        }
+    }
+
+    fn lock_label(lock: Lock) -> &'static str {
+        match lock {
+            Lock::Writable => "writable",
+            Lock::NotListed => "locked (not in --writable, outputs forced 0)",
+            Lock::Drive => "LOCKED (CT drive, outputs forced 0)",
+        }
     }
 
     fn print_nodes(nodes: &[Node]) {
@@ -494,11 +833,7 @@ mod linux {
                 nd.vendor,
                 nd.in_len,
                 nd.out_len,
-                if nd.writable {
-                    "writable"
-                } else {
-                    "LOCKED (drive, outputs forced 0)"
-                },
+                lock_label(nd.lock),
             );
         }
     }
@@ -510,7 +845,6 @@ mod linux {
         Msg(String),
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn handle(
         tok: &[&str],
         nodes: &[Node],
@@ -539,7 +873,7 @@ mod linux {
                         nd.name,
                         nd.in_len,
                         nd.out_len,
-                        if nd.writable { "writable" } else { "locked" }
+                        lock_label(nd.lock)
                     ));
                 }
                 Ok(Some(s))
@@ -620,13 +954,23 @@ mod linux {
     }
 
     fn guard_writable(node: usize, nodes: &[Node]) -> Result<(), Cmd> {
-        if !nodes[node].writable {
-            return Err(Cmd::Msg(format!(
-                "node {node} ({}) is a drive — outputs are locked to 0, refusing write",
-                nodes[node].name
-            )));
+        let nd = &nodes[node];
+        match nd.lock {
+            Lock::Drive => {
+                return Err(Cmd::Msg(format!(
+                    "node {node} ({}) is a CT/Nidec drive (vendor 0xF9) — outputs hard-locked to 0, refusing write",
+                    nd.name
+                )));
+            }
+            Lock::NotListed => {
+                return Err(Cmd::Msg(format!(
+                    "node {node} ({}) is not in --writable — outputs locked to 0, refusing write (restart with --writable {node})",
+                    nd.name
+                )));
+            }
+            Lock::Writable => {}
         }
-        if nodes[node].out_len == 0 {
+        if nd.out_len == 0 {
             return Err(Cmd::Msg(format!("node {node} has no outputs")));
         }
         Ok(())
@@ -636,10 +980,10 @@ mod linux {
         ls                          nodes + IO sizes + writable flag\n  \
         ri <node>                   show INPUT bytes (+ set-bit list)\n  \
         ro <node>                   show OUTPUT bytes we drive\n  \
-        wo <node> <off> <byte...>   write OUTPUT bytes from offset\n  \
+        wo <node> <off> <byte...>   write OUTPUT bytes from offset (node must be in --writable)\n  \
         sb <node> <bit>             set   one output bit (bit = off*8 + bitInByte)\n  \
         cb <node> <bit>             clear one output bit\n  \
         watch <node> | watch off    print inputs on change / stop\n  \
-        stats [on|off]              exchange(scan) + cycle-period timing; 'on' auto-prints ~1s\n  \
-        q                           quit (zeroes outputs first)";
+        stats [on|off]              exchange(scan) + period timing, overruns, WKC; 'on' auto-prints ~1s\n  \
+        q                           quit (zeroes outputs first; Ctrl-C / SIGTERM do the same)";
 }

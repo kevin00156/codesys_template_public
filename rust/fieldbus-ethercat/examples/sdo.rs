@@ -16,7 +16,7 @@
 //! `EthercatBackend`.
 //!
 //! Usage (needs root / CAP_NET_RAW):
-//!   sdo --ifname enp2s0
+//!   sdo --ifname enp2s0 [--allow-vendor-write]
 //!
 //! Then type commands. It reads stdin line by line, so it works both
 //! interactively and piped:
@@ -25,12 +25,22 @@
 //! Address syntax: an object is `<idx> <sub>` (two tokens) OR `<idx>:<sub>`
 //! (one token, matching CODESYS' `16#2008:16#14` — just prefix both with 0x).
 //! idx/sub take 0x-hex or decimal; node = 0-based chain position.
+//! Signed values (i8/i16/i32) take decimal with optional `-`, or hex — either
+//! `-0x10` or the two's-complement pattern of the target width (`0xffff` as
+//! i16 = -1).
+//!
+//! **Vendor objects (0x2000..=0x5FFF) are write-locked by default.** On the
+//! CT drive they are the parameter menus (`0x2000 + menu`, sub = param) and
+//! a write takes effect *immediately*, PREOP or not — e.g. Pr 6.15 (drive
+//! enable). Pass `--allow-vendor-write` to permit them; profile/comm objects
+//! (0x1000.. and 0x6000..) are not affected by the lock.
 //!
 //! Commands:
 //!   ls                                     list the subdevices from the scan
 //!   r <node> <idx[:sub]> [sub] [type]      read  SDO  (type: u8 u16 u32 i8 i16 i32 str hex; default hex)
 //!   w <node> <idx[:sub]> [sub] <type> <v>  write SDO  (type: u8 u16 u32 i8 i16 i32)
-//!   watch <node> <idx[:sub]> <type> [...]  poll a set of objects, print on change (Ctrl-C to stop)
+//!   watch <node> <idx[:sub]> <type> [...]  poll a set of objects, print on change (Ctrl-C to stop;
+//!                                          a transient SDO failure is logged, 5 in a row abort)
 //!   help                                   show this list
 //!   q                                      quit
 //!
@@ -79,27 +89,41 @@ mod linux {
         WATCH_STOP.store(true, Ordering::SeqCst);
     }
 
-    fn parse_ifname() -> Result<String, String> {
+    /// Manufacturer-specific profile area of the CoE object dictionary. On
+    /// the CT drive these are the live parameter menus.
+    const VENDOR_OBJECTS: std::ops::RangeInclusive<u16> = 0x2000..=0x5FFF;
+
+    struct Args {
+        ifname: String,
+        /// `--allow-vendor-write`: permit `w` on 0x2000..=0x5FFF.
+        allow_vendor_write: bool,
+    }
+
+    fn parse_args() -> Result<Args, String> {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
-        let mut ifname = String::new();
+        let mut a = Args {
+            ifname: String::new(),
+            allow_vendor_write: false,
+        };
         while i < argv.len() {
             match argv[i].as_str() {
                 "--ifname" => {
-                    ifname = argv
+                    a.ifname = argv
                         .get(i + 1)
                         .ok_or_else(|| "--ifname needs a value".to_string())?
                         .clone();
                     i += 1;
                 }
+                "--allow-vendor-write" => a.allow_vendor_write = true,
                 other => return Err(format!("unknown flag {other}")),
             }
             i += 1;
         }
-        if ifname.is_empty() {
+        if a.ifname.is_empty() {
             return Err("--ifname is required (e.g. --ifname enp2s0)".into());
         }
-        Ok(ifname)
+        Ok(a)
     }
 
     /// Accept `0x1a` / `0X1A` hex or plain decimal, into a u32 we then narrow.
@@ -113,14 +137,47 @@ mod linux {
         r.map_err(|_| format!("bad number: {s}"))
     }
 
-    /// Same, but signed (for i8/i16/i32 writes): decimal or 0x-hex.
-    fn parse_i64(s: &str) -> Result<i64, String> {
+    /// Signed value of `bits` width (for i8/i16/i32 writes). Accepts:
+    ///   * decimal with optional leading `-` (`-1`, `42`);
+    ///   * hex with a leading `-` (`-0x10` = -16);
+    ///   * unsigned hex as the two's-complement bit pattern of the target
+    ///     width (`0xffff` as i16 = -1, `0x8000` as i16 = -32768).
+    ///
+    /// Anything outside the width is an error (`0x10000` for i16).
+    fn parse_signed(s: &str, bits: u32) -> Result<i64, String> {
         let s = s.trim();
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            i64::from_str_radix(hex, 16).map_err(|_| format!("bad number: {s}"))
+        let (neg, body) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        let v = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            let raw = u64::from_str_radix(hex, 16).map_err(|_| format!("bad number: {s}"))?;
+            if raw >= (1u64 << bits) {
+                return Err(format!("{s} does not fit in {bits} bits"));
+            }
+            let raw = raw as i64;
+            if neg {
+                -raw
+            } else if raw > max {
+                // High bit set and no explicit sign: read as two's complement.
+                raw - (1i64 << bits)
+            } else {
+                raw
+            }
         } else {
-            s.parse::<i64>().map_err(|_| format!("bad number: {s}"))
+            let mag = body.parse::<i64>().map_err(|_| format!("bad number: {s}"))?;
+            if neg {
+                -mag
+            } else {
+                mag
+            }
+        };
+        if v < min || v > max {
+            return Err(format!("{s} out of range for i{bits} ({min}..={max})"));
         }
+        Ok(v)
     }
 
     fn is_type(s: &str) -> bool {
@@ -155,17 +212,18 @@ mod linux {
     }
 
     pub fn main() {
-        let ifname = match parse_ifname() {
-            Ok(s) => s,
+        let args = match parse_args() {
+            Ok(a) => a,
             Err(e) => {
                 eprintln!("sdo: {e}");
                 std::process::exit(2);
             }
         };
-        std::process::exit(smol::block_on(run(ifname)));
+        std::process::exit(smol::block_on(run(args)));
     }
 
-    async fn run(ifname: String) -> i32 {
+    async fn run(args: Args) -> i32 {
+        let ifname = args.ifname.clone();
         // One leaked storage — the process opens exactly one bus. The tx/rx
         // task must outlive this scope, so 'static is required anyway.
         let storage: &'static Storage = Box::leak(Box::new(Storage::new()));
@@ -226,6 +284,11 @@ mod linux {
             group.len()
         );
         eprintln!("hint: r 0 0x1008 str  (device name)   |   r 0 0x2008:0x14 u16  (an object at sub 0x14)");
+        if args.allow_vendor_write {
+            eprintln!("vendor objects 0x2000..0x5FFF are WRITABLE (--allow-vendor-write) — on the CT drive a write takes effect immediately.");
+        } else {
+            eprintln!("vendor objects 0x2000..0x5FFF are write-locked (pass --allow-vendor-write to change drive parameters).");
+        }
         eprintln!("type 'help' for commands, 'q' to quit.\n");
 
         let stdin = std::io::stdin();
@@ -255,7 +318,7 @@ mod linux {
                     Ok(s) => println!("{s}"),
                     Err(e) => eprintln!("sdo: {e}"),
                 },
-                "w" | "write" => match do_write(&group, &maindevice, &tok).await {
+                "w" | "write" => match do_write(&group, &maindevice, &tok, args.allow_vendor_write).await {
                     Ok(s) => println!("{s}"),
                     Err(e) => eprintln!("sdo: {e}"),
                 },
@@ -275,8 +338,9 @@ mod linux {
             "commands (address = '<idx> <sub>' or '<idx>:<sub>'; 0x-hex or decimal):\n  \
              ls                                     list subdevices\n  \
              r <node> <idx[:sub]> [sub] [type]      read  SDO (type: u8 u16 u32 i8 i16 i32 bool str hex; default hex)\n  \
-             w <node> <idx[:sub]> [sub] <type> <v>  write SDO (type: u8 u16 u32 i8 i16 i32 bool)\n  \
-             watch <node> <idx[:sub]> <type> [...]  poll objects, print a line on change (Ctrl-C to stop)\n  \
+             w <node> <idx[:sub]> [sub] <type> <v>  write SDO (type: u8 u16 u32 i8 i16 i32 bool; signed: -5, -0x10, 0xffff=-1)\n  \
+             \x20                                      vendor objects 0x2000..0x5FFF need --allow-vendor-write\n  \
+             watch <node> <idx[:sub]> <type> [...]  poll objects, print a line on change (Ctrl-C to stop; 5 failures in a row abort)\n  \
              help / q\n\
              e.g.  r 0 0x2008:0x14 u16   |   watch 0 0x2008:0x14 hex 0x2013:0x0a u16"
         );
@@ -404,6 +468,7 @@ mod linux {
         group: &Group,
         md: &MainDevice<'static>,
         tok: &[&str],
+        allow_vendor_write: bool,
     ) -> Result<String, String> {
         // w <node> <idx[:sub]> [sub] <type> <value>
         if tok.len() < 4 {
@@ -441,6 +506,15 @@ mod linux {
             (sub, ty, raw)
         };
 
+        if VENDOR_OBJECTS.contains(&index) && !allow_vendor_write {
+            return Err(format!(
+                "refusing write to vendor object {index:#06x}:{sub:#04x}: on the CT drive 0x2000..0x5FFF are the live parameter menus \
+                 (Pr {}.{sub} here) and a write takes effect immediately even in PREOP (e.g. Pr 6.15 = drive enable) — \
+                 restart with --allow-vendor-write to permit",
+                index - 0x2000
+            ));
+        }
+
         let sd = group
             .subdevice(md, node)
             .map_err(|_| format!("no such node {node}"))?;
@@ -463,19 +537,19 @@ mod linux {
                 format!("{v} (0x{v:08x})")
             }
             "i8" => {
-                let v = i8::try_from(parse_i64(raw)?).map_err(|_| "value out of range for i8")?;
+                let v = i8::try_from(parse_signed(raw, 8)?).map_err(|_| "value out of range for i8")?;
                 sd.sdo_write(index, sub, v).await.map_err(m)?;
-                format!("{v}")
+                format!("{v} (0x{:02x})", v as u8)
             }
             "i16" => {
-                let v = i16::try_from(parse_i64(raw)?).map_err(|_| "value out of range for i16")?;
+                let v = i16::try_from(parse_signed(raw, 16)?).map_err(|_| "value out of range for i16")?;
                 sd.sdo_write(index, sub, v).await.map_err(m)?;
-                format!("{v}")
+                format!("{v} (0x{:04x})", v as u16)
             }
             "i32" => {
-                let v = i32::try_from(parse_i64(raw)?).map_err(|_| "value out of range for i32")?;
+                let v = i32::try_from(parse_signed(raw, 32)?).map_err(|_| "value out of range for i32")?;
                 sd.sdo_write(index, sub, v).await.map_err(m)?;
-                format!("{v}")
+                format!("{v} (0x{:08x})", v as u32)
             }
             "bool" => {
                 let v: u8 = if parse_bool(raw)? { 1 } else { 0 };
@@ -559,6 +633,11 @@ mod linux {
         let start = Instant::now();
         let mut last: Option<Vec<String>> = None;
         let mut cycles = 0usize;
+        // A single SDO failure (one 1 s mailbox timeout, a busy drive) must
+        // not end a long watch; only a sustained run of failures does.
+        const MAX_CONSECUTIVE_FAILURES: usize = 5;
+        let mut consecutive_failures = 0usize;
+        let mut total_failures = 0usize;
         let outcome = loop {
             if WATCH_STOP.load(Ordering::SeqCst) {
                 break Ok(());
@@ -576,8 +655,21 @@ mod linux {
             }
             cycles += 1;
             if let Some(e) = failed {
-                break Err(e);
+                consecutive_failures += 1;
+                total_failures += 1;
+                eprintln!(
+                    "  t={:7.2}s  watch: {e} ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES} consecutive — continuing)",
+                    start.elapsed().as_secs_f64()
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    break Err(format!(
+                        "watch: {MAX_CONSECUTIVE_FAILURES} consecutive SDO failures ({total_failures} total) — giving up"
+                    ));
+                }
+                smol::Timer::after(Duration::from_millis(WATCH_PERIOD_MS)).await;
+                continue;
             }
+            consecutive_failures = 0;
             if last.as_ref() != Some(&row) {
                 let cells: Vec<String> = items
                     .iter()
@@ -594,7 +686,7 @@ mod linux {
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
-        eprintln!("watch: stopped after {cycles} poll cycle(s)");
+        eprintln!("watch: stopped after {cycles} poll cycle(s), {total_failures} failed");
         outcome
     }
 }
